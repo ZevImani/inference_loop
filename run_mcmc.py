@@ -340,55 +340,55 @@ def batch_emd_loss_vectorized(target_batch, proposed_batch):
 	return distances
 
 def batch_l2_loss(target_batch, proposed_batch):
-    """
-    Compute L2 (Euclidean) distance between target and proposed batches.
-    This measures the square root of sum of squared differences.
-    """
-    # Ensure proper dimensions
-    if target_batch.ndim == 4:
-        target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
-    if proposed_batch.ndim == 4:
-        proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
-    
-    batch_size = target_batch.shape[0]
-    distances = []
-    
-    # Process all pairs in the batch
-    for i in range(batch_size):
-        target = target_batch[i]
-        proposed = proposed_batch[i]
-        
-        # Compute L2 distance (Euclidean norm)
-        distance = torch.norm(target - proposed, p=2).item()
-        distances.append(distance)
-    
-    return distances
+	"""
+	Compute L2 (Euclidean) distance between target and proposed batches.
+	This measures the square root of sum of squared differences.
+	"""
+	# Ensure proper dimensions
+	if target_batch.ndim == 4:
+		target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
+	if proposed_batch.ndim == 4:
+		proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
+	
+	batch_size = target_batch.shape[0]
+	distances = []
+	
+	# Process all pairs in the batch
+	for i in range(batch_size):
+		target = target_batch[i]
+		proposed = proposed_batch[i]
+		
+		# Compute L2 distance (Euclidean norm)
+		distance = torch.norm(target - proposed, p=2).item()
+		distances.append(distance)
+	
+	return distances
 
 
 def batch_mse_loss(target_batch, proposed_batch):
-    """
-    Compute Mean Squared Error between target and proposed batches.
-    This measures the average of squared differences across all elements.
-    """
-    # Ensure proper dimensions
-    if target_batch.ndim == 4:
-        target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
-    if proposed_batch.ndim == 4:
-        proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
-    
-    batch_size = target_batch.shape[0]
-    distances = []
-    
-    # Process all pairs in the batch
-    for i in range(batch_size):
-        target = target_batch[i]
-        proposed = proposed_batch[i]
-        
-        # Compute MSE
-        distance = torch.mean((target - proposed) ** 2).item()
-        distances.append(distance)
-    
-    return distances
+	"""
+	Compute Mean Squared Error between target and proposed batches.
+	This measures the average of squared differences across all elements.
+	"""
+	# Ensure proper dimensions
+	if target_batch.ndim == 4:
+		target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
+	if proposed_batch.ndim == 4:
+		proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
+	
+	batch_size = target_batch.shape[0]
+	distances = []
+	
+	# Process all pairs in the batch
+	for i in range(batch_size):
+		target = target_batch[i]
+		proposed = proposed_batch[i]
+		
+		# Compute MSE
+		distance = torch.mean((target - proposed) ** 2).item()
+		distances.append(distance)
+	
+	return distances
 
 # Original single-image EMD function (kept for compatibility)
 def weights_and_positions(matrix): 
@@ -424,7 +424,7 @@ background_threshold = 5e-2
 ## Hack to fix imports 
 import torch
 sys.path.append('/n/home11/zimani/reco_model/')
-from ResNet.ResNet import ResNet50 # reco momentum model 
+from ResNet import ResNet50 # reco momentum model 
 
 # Load model and weights 
 reco_model_checkpoint = '/n/home11/zimani/reco_model/checkpoints/ResNet50_edep_v4/ResNet50_epoch100.pt'
@@ -449,7 +449,7 @@ def reco_model(batch):
 
 ## LDM Generator ### 
 sys.path.append("/n/home11/zimani/latent-diffusion") 
-from gen_cLDM import generate_conditioned_samples
+from run_condLDM import generate_conditioned_samples
 
 def ldm_generator(x, y, z): 
 	batch = generate_conditioned_samples(
@@ -469,10 +469,12 @@ def ldm_generator(x, y, z):
 
 if __name__ == "__main__":
 
-	x, y, z = 314.0, -126.4, 249.1  # sample 1 truth momentum
-	sample1 = np.load("sample1.npy")
+	# x, y, z = 314.0, -126.4, 249.1  # sample 1 truth momentum
+	# sample1 = np.load("sample1.npy")
 
 	colinear = np.load("/n/home11/zimani/proton64_analysis/double_momentum/angle_separated_pairs_with_emd.npy", allow_pickle=True)
+
+	start_time = time.time() 
 
 	print(colinear.shape)
 
@@ -494,8 +496,9 @@ if __name__ == "__main__":
 	# 	'midpoint_angle': mid_angle_deg
 	# })
 
+	desired_angle = 60.8
 	for co in colinear: 
-		if np.abs(co['separation'] - 16.1) < 0.1:  
+		if np.abs(co['separation'] - desired_angle) < 0.1:  
 			print(co['separation'])
 
 			double_track = co['event1']['image'] + co['event2']['image']
@@ -549,7 +552,11 @@ if __name__ == "__main__":
 	)
 	
 	print("FINAL RECO MOM")
-	print(reco_model(np.array(img_path[-1].unsqueeze(0))))
+	# final_mom = reco_model(np.array(img_path[-1].unsqueeze(0)))
+	# print(reco_model(np.array(img_path[-1].unsqueeze(0))))
+	# print(f"True Mom: {final_mom[0]:.1f}, {final_mom[1]:.1f}, {final_mom[2]:.1f}")
+	final_mom = mom_path[-1]
+	print(f"Pred Mom: {final_mom[0]:.1f}, {final_mom[1]:.1f}, {final_mom[2]:.1f}")
 
 	if True: 
 		# Save outputs for use in plotting script 
@@ -561,18 +568,29 @@ if __name__ == "__main__":
 
 	print("DONE MCMC")
 
+	plt.cla() 
+	plt.imshow(img_path[-1], cmap='gray')
+	plt.savefig("mcmc_outputs/final_image.png")
+	plt.cla() 
+
+	end_time = time.time() - start_time
+	print("End Time:", np.round(end_time, 2), "seconds")
+	print("Time per iteration:", np.round(end_time / len(result[0]), 2), "seconds")
+
+
+	x,y,z = 0,0,0
 	truth_mom = (x,y,z)
 
 	# Plot results
 	from plot_mcmc import plot_images_only, plot_mcmc_results_with_std, create_image_evolution_gif
 	
-	# Plot images in separate figure with gray colormap
-	create_image_evolution_gif(img_path, dist_path, mom_path, explore_path, truth_mom,
-								save_path='mcmc_evolution.gif', fps=2)
+	# # Plot images in separate figure with gray colormap
+	# create_image_evolution_gif(img_path, dist_path, mom_path, explore_path, truth_mom,
+	# 							save_path='mcmc_evolution.gif', fps=2)
 
 	# Plot images only
 	fig_images = plot_images_only(img_path, dist_path, mom_path, explore_path, truth_mom,
-									save_path='mcmc_images.png')
+									save_path='./mcmc_plots/mcmc_images.png')
 	
 	# Plot full results (without images, without std, with truth markers)
 	fig = plot_mcmc_results_with_std(img_path, dist_path, mom_path, explore_path, std_path, truth_mom,

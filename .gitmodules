@@ -1,0 +1,6 @@
+[submodule "Proton64_Reco_Model"]
+	path = Proton64_Reco_Model
+	url = https://github.com/ZevImani/Proton64_Reco_Model.git
+[submodule "latent-diffusion"]
+	path = latent-diffusion
+	url = git@github.com:ZevImani/latent-diffusion.git

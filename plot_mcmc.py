@@ -642,6 +642,10 @@ if __name__ == "__main__":
 		exit() 
 
 
+	plt.imshow(img_path[-1].squeeze(), cmap='gray')
+	plt.savefig('mcmc_plots/tmp.png', dpi=150)
+	exit() 
+
 	# Truth momentum values (example)
 	truth_mom = (314.0, -126.4, 249.1)
 

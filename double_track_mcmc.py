@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import sys, os
 import torch 
 import time
+import torch
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
@@ -363,6 +364,8 @@ def run_mcmc(generator, dist_func, reco_func=None, true_img=None, true_mom=None,
 	else:
 		return img_path, dist_path, mom_path, explore_path, std_path
 
+
+## EMD Loss Function ##
 from geomloss import SamplesLoss  
 
 def weights_and_positions_batch(batch_matrices):
@@ -423,153 +426,11 @@ def batch_emd_loss(target_batch, proposed_batch):
 	return distances
 
 
-def batch_emd_loss_vectorized(target_batch, proposed_batch):
-	"""
-	Fully vectorized EMD loss computation (more advanced version)
-	This version tries to compute multiple EMDs simultaneously when possible
-	
-	Args:
-		target_batch: Tensor of shape (batch_size, height, width)
-		proposed_batch: Tensor of shape (batch_size, height, width)
-	
-	Returns:
-		List of EMD distances
-	"""
-	batch_size = target_batch.shape[0]
-	distances = []
-	
-	# Try to group similar sparsity patterns for vectorized computation
-	EMD = SamplesLoss("sinkhorn", p=1, blur=0.01)
-	
-	# Process in mini-batches of compatible sparsity patterns
-	for i in range(batch_size):
-		target = target_batch[i]
-		proposed = proposed_batch[i]
-		
-		# Squeeze dimensions if needed
-		if target.ndim == 3:
-			target = target.squeeze()
-		if proposed.ndim == 3:
-			proposed = proposed.squeeze()
-		
-		# Extract positions and weights
-		target_positions = torch.nonzero(target).float()
-		target_weights = target[target_positions[:, 0].long(), target_positions[:, 1].long()]
-		
-		proposed_positions = torch.nonzero(proposed).float()
-		proposed_weights = proposed[proposed_positions[:, 0].long(), proposed_positions[:, 1].long()]
-		
-		# Handle edge cases
-		if len(target_positions) == 0:
-			target_positions = torch.tensor([[0.0, 0.0]])
-			target_weights = torch.tensor([1e-8])
-		if len(proposed_positions) == 0:
-			proposed_positions = torch.tensor([[0.0, 0.0]])
-			proposed_weights = torch.tensor([1e-8])
-		
-		# Normalize weights
-		target_weights = target_weights / target_weights.sum()
-		proposed_weights = proposed_weights / proposed_weights.sum()
-		
-		# Compute EMD
-		if len(target_positions) == 1 and len(proposed_positions) == 1 and torch.equal(target_positions, proposed_positions):
-			distance = 0.0
-		else:
-			try:
-				distance = EMD(target_weights, target_positions, proposed_weights, proposed_positions).item()
-			except Exception as e:
-				print(f"Vectorized EMD failed for item {i}: {e}")
-				distance = float('inf')
-		
-		distances.append(distance)
-	
-	return distances
-
-def batch_l2_loss(target_batch, proposed_batch):
-    """
-    Compute L2 (Euclidean) distance between target and proposed batches.
-    This measures the square root of sum of squared differences.
-    """
-    # Ensure proper dimensions
-    if target_batch.ndim == 4:
-        target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
-    if proposed_batch.ndim == 4:
-        proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
-    
-    batch_size = target_batch.shape[0]
-    distances = []
-    
-    # Process all pairs in the batch
-    for i in range(batch_size):
-        target = target_batch[i]
-        proposed = proposed_batch[i]
-        
-        # Compute L2 distance (Euclidean norm)
-        distance = torch.norm(target - proposed, p=2).item()
-        distances.append(distance)
-    
-    return distances
-
-def batch_mse_loss(target_batch, proposed_batch):
-    """
-    Compute Mean Squared Error between target and proposed batches.
-    This measures the average of squared differences across all elements.
-    """
-    # Ensure proper dimensions
-    if target_batch.ndim == 4:
-        target_batch = target_batch.squeeze(1)  # Remove channel dimension if present
-    if proposed_batch.ndim == 4:
-        proposed_batch = proposed_batch.squeeze(1)  # Remove channel dimension if present
-    
-    batch_size = target_batch.shape[0]
-    distances = []
-    
-    # Process all pairs in the batch
-    for i in range(batch_size):
-        target = target_batch[i]
-        proposed = proposed_batch[i]
-        
-        # Compute MSE
-        distance = torch.mean((target - proposed) ** 2).item()
-        distances.append(distance)
-    
-    return distances
-
-# Original single-image EMD function (kept for compatibility)
-def weights_and_positions(matrix): 
-	positions = torch.nonzero(matrix).float()
-	weights = matrix[positions[:, 0].long(), positions[:, 1].long()]
-	return weights, positions 
-
-def emd_loss(a, b): 
-	if a.ndim == 3: 
-		a = torch.squeeze(a) 
-	if b.ndim == 3:
-		b = torch.squeeze(b)
-
-	a_w, a_p = weights_and_positions(a)
-	b_w, b_p = weights_and_positions(b)
-
-	## Normalize weights for balanced EMD
-	a_w = a_w / a_w.sum()
-	b_w = b_w / b_w.sum()
-
-	EMD = SamplesLoss("sinkhorn", p=1, blur=0.01)
-
-	## Prevent single sample at same location 
-	if len(a_p) == 1 and len(b_p) == 1 and torch.equal(a_p, b_p):
-		distance = 0 
-	else: 
-		distance = EMD(a_w, a_p, b_w, b_p).item()
-	return distance 
-
 background_threshold = 5e-2
 
 ### Reco Model ## 
-## Hack to fix imports 
 import torch
-sys.path.append('/n/home11/zimani/reco_model/')
-from ResNet.ResNet import ResNet50 # reco momentum model 
+from Proton64_Reco_Model.ResNet import ResNet50 # reco momentum model 
 
 # Load model and weights 
 reco_model_checkpoint = '/n/home11/zimani/reco_model/checkpoints/ResNet50_edep_v4/ResNet50_epoch100.pt'
@@ -594,7 +455,7 @@ def reco_model(batch):
 
 ## LDM Generator ### 
 sys.path.append("/n/home11/zimani/latent-diffusion") 
-from gen_cLDM import generate_conditioned_samples
+from run_condLDM import generate_conditioned_samples
 
 def ldm_generator(x, y, z): 
 	batch = generate_conditioned_samples(
@@ -614,21 +475,33 @@ def ldm_generator(x, y, z):
 
 if __name__ == "__main__":
 
-	x, y, z = 314.0, -126.4, 249.1  # sample 1 truth momentum
-	sample1 = np.load("sample1.npy")
+	# x, y, z = 314.0, -126.4, 249.1  # sample 1 truth momentum
+	# sample1 = np.load("sample1.npy")
 
 	colinear = np.load("/n/home11/zimani/proton64_analysis/double_momentum/angle_separated_pairs_with_emd.npy", allow_pickle=True)
 
 	# Find a pair at ~16.1 degrees separation
+	# desired_angle = 16.1 
+	desired_angle = 60.8
 	for co in colinear: 
-		if np.abs(co['separation'] - 16.1) < 0.1:  
+		print(co['separation'])
+		if np.abs(co['separation'] - desired_angle) < 0.1:  
 			print(f"Found pair with separation: {co['separation']}")
 			double_track = co['event1']['image'] + co['event2']['image']
 			mom1_true = co['event1']['momentum']
 			mom2_true = co['event2']['momentum']
-			print(f"True momentum 1: {mom1_true}")
-			print(f"True momentum 2: {mom2_true}")
+			print(f"True momentum 1: {mom1_true[0]:.1f}, {mom1_true[1]:.1f}, {mom1_true[2]:.1f}")
+			print(f"True momentum 2: {mom2_true[0]:.1f}, {mom2_true[1]:.1f}, {mom2_true[2]:.1f}")
 			break 
+
+	# exit() 
+
+	plt.imshow(double_track, cmap='gray')
+	plt.savefig("mcmc_plots/double_track_truth.png")
+	plt.clf() 
+	# exit() 
+
+	start_time = time.time()
 
 	# Run MCMC in dual-track mode
 	result = run_mcmc(
@@ -648,15 +521,21 @@ if __name__ == "__main__":
 		true_mom2=None  # Will be initialized by grid search
 	)
 	
+	end_time = time.time() - start_time
+	print("End Time:", np.round(end_time, 2), "seconds")
+	print("Time per iteration:", np.round(end_time / len(result[0]), 2), "seconds")
+
+
+
 	# Unpack results based on mode
 	if len(result) == 6:  # Dual track mode
 		img_path, dist_path, mom_path, mom2_path, explore_path, std_path = result
 		print("\nFINAL RECO MOMENTA:")
-		print(f"Track 1: {reco_model(np.array(img_path[-1].unsqueeze(0)))}")
+		# print(f"Track 1: {reco_model(np.array(img_path[-1].unsqueeze(0)))}")
 		# Note: Can't directly reconstruct individual tracks from combined image
 		# But we have the optimized momenta: mom_path[-1] and mom2_path[-1]
-		print(f"Optimized Track 1 momentum: {mom_path[-1]}")
-		print(f"Optimized Track 2 momentum: {mom2_path[-1]}")
+		print(f"Pred Track 1 momentum: {mom_path[-1][0]:.1f}, {mom_path[-1][1]:.1f}, {mom_path[-1][2]:.1f}")
+		print(f"Pred Track 2 momentum: {mom2_path[-1][0]:.1f}, {mom2_path[-1][1]:.1f}, {mom2_path[-1][2]:.1f}")
 	else:  # Single track mode
 		img_path, dist_path, mom_path, explore_path, std_path = result
 		mom2_path = None
@@ -672,6 +551,11 @@ if __name__ == "__main__":
 		np.save("mcmc_outputs/dist_path.npy", np.array(dist_path))
 		np.save("mcmc_outputs/explore_path.npy", np.array(explore_path))
 		np.save("mcmc_outputs/std_path.npy", np.array(std_path))
+
+	plt.clf() 
+	plt.imshow(img_path[-1], cmap='gray')
+	plt.savefig("mcmc_plots/final_image.png")
+	plt.clf() 
 
 	print("DONE MCMC")
 
@@ -696,7 +580,7 @@ if __name__ == "__main__":
 
 	# Plot images only
 	fig_images = plot_images_only(img_path, dist_path, mom_path, explore_path, truth_mom,
-									save_path='mcmc_images.png', mom2_path=mom2_path)
+									save_path='./mcmc_plots/mcmc_images.png', mom2_path=mom2_path)
 	
 	# Plot full results
 	fig = plot_mcmc_results_with_std(img_path, dist_path, mom_path, explore_path, std_path, truth_mom,
