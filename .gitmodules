@@ -4,3 +4,6 @@
 [submodule "latent-diffusion"]
 	path = latent-diffusion
 	url = git@github.com:ZevImani/latent-diffusion.git
+[submodule "Proton64_Analysis"]
+	path = Proton64_Analysis
+	url = git@github.com:ZevImani/Proton64_Analysis.git
