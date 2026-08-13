@@ -11,7 +11,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-sys.path.append('/n/home11/zimani/reco_model/')
 sys.path.append("/n/home11/zimani/latent-diffusion")
 
 from omegaconf import OmegaConf
@@ -20,13 +19,15 @@ from helper_inference import (
     DifferentiableLDMGenerator,
     emd_loss_with_gradients,
     l2_loss_with_gradients,
+    get_loss_fn,
+    LOSS_NAMES,
+    convex_hull_initial_guess,
+    image_pmag_estimate,
 )
-from ResNet import ResNet50
 
 # ── Default paths ──────────────────────────────────────────────────────────────
 LDM_CONFIG_PATH     = "/n/home11/zimani/latent-diffusion/configs/latent-diffusion/protons64-ldm-kl.yaml"
 LDM_CHECKPOINT_PATH = "/n/home11/zimani/latent-diffusion/edep_protons64_v2_ldm/runs/checkpoints/epoch=000075.ckpt"
-RECO_CHECKPOINT     = '/n/home11/zimani/reco_model/checkpoints/ResNet50_edep_v4/ResNet50_epoch100.pt'
 
 
 # ── Model loaders ──────────────────────────────────────────────────────────────
@@ -40,29 +41,6 @@ def load_ldm(device, config_path=LDM_CONFIG_PATH, checkpoint_path=LDM_CHECKPOINT
     ldm.to(device).eval()
     print("LDM loaded.\n")
     return ldm
-
-
-def load_reco_model(device, checkpoint_path=RECO_CHECKPOINT):
-    model = ResNet50(num_classes=3, channels=1, norm='batch')
-    model.to(device)
-    model.load_state_dict(
-        torch.load(checkpoint_path, weights_only=True)['model_state_dict']
-    )
-    model.eval()
-    return model
-
-
-def reco_predict(reco_model, raw_img, device):
-    arr = np.array(raw_img, dtype=np.float32)
-    if arr.ndim == 2:
-        inp = torch.tensor(arr).unsqueeze(0).unsqueeze(0).to(device)
-    elif arr.ndim == 3:
-        inp = torch.tensor(arr).unsqueeze(0).to(device)
-    else:
-        inp = torch.tensor(arr).to(device)
-    with torch.no_grad():
-        pred = reco_model(inp)
-    return (pred.squeeze().cpu().numpy() * 500).tolist()
 
 
 def random_momentum_init(p_min=100, p_max=500, component_range=300, seed=None):
@@ -93,6 +71,8 @@ def _run_sgd_core(
     device='cuda',
     verbose=True,
     loss_type='emd',
+    loss_fn=None,           # callable override; if set, takes precedence over loss_type
+    reparam_pmag=False,     # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
 ):
     """
     Gradient descent over N sets of (px, py, pz) simultaneously.
@@ -111,21 +91,47 @@ def _run_sgd_core(
     explore_path: list of bool (always False)
     lr_path     : list of float learning rates
     """
-    loss_fn = l2_loss_with_gradients if loss_type == 'l2' else emd_loss_with_gradients
+    if loss_fn is None:
+        loss_fn = get_loss_fn(loss_type)
 
     n_tracks = len(initial_momenta)
     SCALE    = 500.0
     target_img = target_img.to(device)
 
-    # Build N×3 learnable parameter groups
+    # Build N×3 learnable parameter groups: [px/SCALE, py/SCALE, |p|/SCALE]
+    # Optimise |p| (total momentum magnitude) instead of pz.  pz is derived as
+    # sign_pz * sqrt(|p|^2 - px^2 - py^2), mirroring the reco model's strategy.
+    # This gives the optimizer a direct handle on track length (the main pz signal
+    # in a single 2D projection), which is otherwise invisible to d(EMD)/d(pz).
     params_list = []
+    sign_pz_list = []
     for init_mom in initial_momenta:
+        px0, py0, pz0 = float(init_mom[0]), float(init_mom[1]), float(init_mom[2])
+        if reparam_pmag:
+            p3 = np.sqrt(px0**2 + py0**2 + pz0**2)  # |p|
+            sign_pz_list.append(1.0 if pz0 >= 0 else -1.0)
+        else:
+            p3 = pz0
+            sign_pz_list.append(1.0)  # unused in direct mode
         group = [
-            torch.tensor(float(init_mom[i]) / SCALE, dtype=torch.float32,
-                         requires_grad=True, device=device)
-            for i in range(3)
+            torch.tensor(px0 / SCALE, dtype=torch.float32, requires_grad=True, device=device),
+            torch.tensor(py0 / SCALE, dtype=torch.float32, requires_grad=True, device=device),
+            torch.tensor(p3  / SCALE, dtype=torch.float32, requires_grad=True, device=device),
         ]
         params_list.append(group)
+
+    if reparam_pmag:
+        def _pz_derived(group, sign_pz):
+            px_n, py_n, pmag_n = group
+            return sign_pz * torch.sqrt(torch.clamp(pmag_n**2 - px_n**2 - py_n**2, min=1e-8))
+    else:
+        def _pz_derived(group, sign_pz):
+            return group[2]
+
+    def _get_pz_np(i, g):
+        if reparam_pmag:
+            return sign_pz_list[i] * np.sqrt(max(g[2].item()**2 - g[0].item()**2 - g[1].item()**2, 0.0))
+        return g[2].item()
 
     def _make_opt(params):
         if optimizer_type.lower() == 'adam':
@@ -139,17 +145,20 @@ def _run_sgd_core(
     ]
 
     def _current_mom():
-        moms = tuple(
-            tuple(p.item() * SCALE for p in group)
-            for group in params_list
-        )
+        moms = []
+        for i, group in enumerate(params_list):
+            px_n = group[0].item()
+            py_n = group[1].item()
+            pz_n = _get_pz_np(i, group)
+            moms.append((px_n * SCALE, py_n * SCALE, pz_n * SCALE))
+        moms = tuple(moms)
         return moms[0] if n_tracks == 1 else moms
 
     # Record starting state without grad
     with torch.no_grad():
         init_imgs = [
-            generator(g[0].item() * SCALE, g[1].item() * SCALE, g[2].item() * SCALE)
-            for g in params_list
+            generator(g[0].item() * SCALE, g[1].item() * SCALE, _get_pz_np(i, g) * SCALE)
+            for i, g in enumerate(params_list)
         ]
         init_combined = sum(init_imgs)
         init_loss = loss_fn(init_combined, target_img).item()
@@ -165,7 +174,9 @@ def _run_sgd_core(
 
     if verbose:
         for i, g in enumerate(params_list):
-            print(f"Track {i+1} init: ({g[0].item()*SCALE:.2f}, {g[1].item()*SCALE:.2f}, {g[2].item()*SCALE:.2f})")
+            pz_n = _get_pz_np(i, g)
+            pmag_str = f"  |p|={g[2].item()*SCALE:.2f}" if reparam_pmag else ""
+            print(f"Track {i+1} init: ({g[0].item()*SCALE:.2f}, {g[1].item()*SCALE:.2f}, {pz_n*SCALE:.2f}){pmag_str}")
         print(f"Initial {loss_type.upper()} loss: {init_loss:.6f}")
         print(f"Starting {n_tracks}-track SGD ({optimizer_type.upper()}, lr={learning_rate})...")
         print("=" * 70)
@@ -184,9 +195,10 @@ def _run_sgd_core(
         if avg_grad:
             # Generate one batch per track, then sum across tracks element-wise
             batches = [
-                generator(g[0] * SCALE, g[1] * SCALE, g[2] * SCALE,
+                generator(g[0] * SCALE, g[1] * SCALE,
+                          _pz_derived(g, sign_pz_list[t]) * SCALE,
                           batch_size=avg_grad_batch_size)
-                for g in params_list
+                for t, g in enumerate(params_list)
             ]
             losses = torch.stack([
                 loss_fn(
@@ -199,9 +211,12 @@ def _run_sgd_core(
             combined = sum(batches[t][best_idx] for t in range(n_tracks)).detach().cpu()
             current_loss = losses[best_idx].item()
         else:
-            gens     = [generator(g[0] * SCALE, g[1] * SCALE, g[2] * SCALE,
-                                  fixed_z=fixed_z)
-                        for g in params_list]
+            gens = [
+                generator(g[0] * SCALE, g[1] * SCALE,
+                          _pz_derived(g, sign_pz_list[t]) * SCALE,
+                          fixed_z=fixed_z)
+                for t, g in enumerate(params_list)
+            ]
             combined = sum(gens)
             loss     = loss_fn(combined, target_img)
             loss.backward()
@@ -276,6 +291,8 @@ def _run_dual_proj_sgd(
     avg_grad_batch_size=32,
     device='cuda',
     loss_type='emd',
+    loss_fn=None,           # callable override; if set, takes precedence over loss_type
+    reparam_pmag=False,     # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
 ):
     """
     Single (px, py, pz) optimized against both xy and xz projections simultaneously.
@@ -286,19 +303,36 @@ def _run_dual_proj_sgd(
 
     Returns img_path, dist_path, mom_path, lr_path, best_loss, best_mom.
     """
-    loss_fn = l2_loss_with_gradients if loss_type == 'l2' else emd_loss_with_gradients
+    if loss_fn is None:
+        loss_fn = get_loss_fn(loss_type)
 
     SCALE = 500.0
     device = torch.device(device) if isinstance(device, str) else device
     xy_target = xy_target.to(device)
     xz_target = xz_target.to(device)
 
-    px, py, pz = [
-        torch.tensor(float(initial_momentum[i]) / SCALE, dtype=torch.float32,
-                     requires_grad=True, device=device)
-        for i in range(3)
-    ]
-    params = [px, py, pz]
+    px0 = float(initial_momentum[0])
+    py0 = float(initial_momentum[1])
+    pz0 = float(initial_momentum[2])
+
+    px = torch.tensor(px0 / SCALE, dtype=torch.float32, requires_grad=True, device=device)
+    py = torch.tensor(py0 / SCALE, dtype=torch.float32, requires_grad=True, device=device)
+
+    if reparam_pmag:
+        pmag0   = np.sqrt(px0**2 + py0**2 + pz0**2)
+        sign_pz = 1.0 if pz0 >= 0 else -1.0
+        pz_param = torch.tensor(pmag0 / SCALE, dtype=torch.float32, requires_grad=True, device=device)
+        def _pz_n():
+            return sign_pz * torch.sqrt(torch.clamp(pz_param**2 - px**2 - py**2, min=1e-8))
+        def _pz_np():
+            return sign_pz * np.sqrt(max(pz_param.item()**2 - px.item()**2 - py.item()**2, 0.0))
+    else:
+        pz_param = torch.tensor(pz0 / SCALE, dtype=torch.float32, requires_grad=True, device=device)
+        def _pz_n():
+            return pz_param
+        def _pz_np():
+            return pz_param.item()
+    params = [px, py, pz_param]
 
     if optimizer_type.lower() == 'adam':
         opt = torch.optim.Adam(params, lr=learning_rate)
@@ -307,15 +341,15 @@ def _run_dual_proj_sgd(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_iterations, eta_min=lr_min)
 
     def _mom():
-        return tuple(p.item() * SCALE for p in params)
-
-    combined_target = xy_target + xz_target
+        return (px.item() * SCALE, py.item() * SCALE, _pz_np() * SCALE)
 
     with torch.no_grad():
-        _px, _py, _pz = (p.item() * SCALE for p in params)
-        xy0 = generator(_px, _py, _pz)
-        xz0 = generator(_px, _pz, _py)
-        init_loss = loss_fn(xy0 + xz0, combined_target).item()
+        _px_v = px.item() * SCALE
+        _py_v = py.item() * SCALE
+        _pz_v = _pz_np() * SCALE
+        xy0 = generator(_px_v, _py_v, _pz_v)
+        xz0 = generator(_px_v, _pz_v, _py_v)
+        init_loss = (loss_fn(xy0, xy_target) + loss_fn(xz0, xz_target)).item()
 
     img_path  = [(xy0 + xz0).cpu()]
     dist_path = [init_loss]
@@ -332,13 +366,14 @@ def _run_dual_proj_sgd(
 
         opt.zero_grad()
 
-        xy_batch = generator(px * SCALE, py * SCALE, pz * SCALE,
+        pz_t     = _pz_n() * SCALE
+        xy_batch = generator(px * SCALE, py * SCALE, pz_t,
                              batch_size=avg_grad_batch_size)
-        xz_batch = generator(px * SCALE, pz * SCALE, py * SCALE,
+        xz_batch = generator(px * SCALE, pz_t, py * SCALE,
                              batch_size=avg_grad_batch_size)
 
         losses = torch.stack([
-            loss_fn(xy_batch[i] + xz_batch[i], combined_target)
+            loss_fn(xy_batch[i], xy_target) + loss_fn(xz_batch[i], xz_target)
             for i in range(avg_grad_batch_size)
         ])
         losses.mean().backward()
@@ -406,7 +441,9 @@ def run_inference(
     verbose=True,
     save_plots=True,
     generator=None,  # pass a pre-loaded DifferentiableLDMGenerator to skip model loading
-    loss_type='emd', # 'emd' for Sinkhorn EMD or 'l2' for MSE
+    loss_type='emd', # string name resolved via get_loss_fn; ignored when loss_fn is set
+    loss_fn=None,    # callable (generated_img, target_img) -> scalar; overrides loss_type
+    reparam_pmag=False,  # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
 ):
     """
     Run gradient-guided LDM inference to recover proton momenta from a detector image.
@@ -461,7 +498,13 @@ def run_inference(
     save_plots : bool
         Generate and save diagnostic plots.
     loss_type : str
-        'emd' (default) for Sinkhorn Earth Mover's Distance, or 'l2' for MSE.
+        Name of the loss function (resolved via get_loss_fn).  Supported values:
+        'emd'/'w1'/'sinkhorn' (default), 'w2'/'sinkhorn_p2', 'energy',
+        'gaussian_mmd'/'gmmd', 'laplacian_mmd'/'lmmd', 'l2'/'mse'.
+        Ignored when loss_fn is provided.
+    loss_fn : callable or None
+        Custom loss function with signature (generated_img, target_img) -> scalar tensor.
+        When provided, overrides loss_type entirely.
 
     Returns
     -------
@@ -539,6 +582,8 @@ def run_inference(
             avg_grad_batch_size=avg_grad_batch_size,
             device=str(device),
             loss_type=loss_type,
+            loss_fn=loss_fn,
+            reparam_pmag=reparam_pmag,
         )
 
         elapsed = time.time() - start_time
@@ -572,6 +617,8 @@ def run_inference(
             'img_path':     img_path,
             'dist_path':    dist_path,
             'mom_path':     mom_path,
+            'best_mom':     best_mom,
+            'best_loss':    best_loss,
             'explore_path': [False] * len(img_path),
             'lr_path':      lr_path,
             'data_dir':     data_dir,
@@ -624,6 +671,8 @@ def run_inference(
         device=str(device),
         verbose=verbose,
         loss_type=loss_type,
+        loss_fn=loss_fn,
+        reparam_pmag=reparam_pmag,
     )
 
     elapsed = time.time() - start_time
@@ -742,10 +791,18 @@ if __name__ == "__main__":
     parser.add_argument('--avg_grad', action='store_true', default=True)
     parser.add_argument('--no_avg_grad', dest='avg_grad', action='store_false')
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--use_reco', action='store_true', default=False,
-                        help="Seed initial momentum from reco model")
-    parser.add_argument('--loss', type=str, default='emd', choices=['emd', 'l2'],
-                        help="Loss function: 'emd' (Sinkhorn, default) or 'l2' (MSE)")
+    parser.add_argument('--use_hull', action='store_true', default=False,
+                        help="Seed initial momentum from convex-hull guess")
+    parser.add_argument('--use_pmag', action='store_true', default=False,
+                        help="Use energy-based |p| estimator to initialise pmag (requires --use_hull)")
+    parser.add_argument('--reparam_pmag', action='store_true', default=False,
+                        help="Optimise (px, py, |p|) and derive pz instead of direct (px, py, pz)")
+    parser.add_argument('--loss', type=str, default='emd', choices=LOSS_NAMES,
+                        help=(
+                            "Loss function (default: 'emd'). "
+                            "Options: emd/w1/sinkhorn (Wasserstein-1), w2/sinkhorn_p2 (Wasserstein-2), "
+                            "energy (energy distance), gaussian_mmd/gmmd, laplacian_mmd/lmmd, l2/mse"
+                        ))
     
     args = parser.parse_args()
 
@@ -758,7 +815,8 @@ if __name__ == "__main__":
         ddim_steps_standard=50,
         ddim_steps_gradient=10,
     )
-    reco = load_reco_model(device) if args.use_reco else None
+    use_hull = args.use_hull
+    use_pmag = args.use_pmag
 
     # ── Dual-projection mode ───────────────────────────────────────────────────
     if args.dual_projection:
@@ -802,7 +860,10 @@ if __name__ == "__main__":
             print(f"Event {ev_i+1}/{args.n_events}  (batch={batch_idx}, event={event_idx})")
             print(f"True momentum: ({true_momentum[0]:.1f}, {true_momentum[1]:.1f}, {true_momentum[2]:.1f})")
 
-            initial_momenta_cli = [reco_predict(reco, raw_img, device)] if reco else None
+            initial_momenta_cli = (
+                convex_hull_initial_guess(raw_img, n_tracks=1, use_pmag_estimate=use_pmag)
+                if use_hull else None
+            )
 
             run_name = args.run_name or (
                 f"dual_proj_b{batch_idx}_e{event_idx}" + ("_l2" if args.loss == 'l2' else "")
@@ -828,6 +889,7 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                reparam_pmag=args.reparam_pmag,
             )
 
     # ── Multi-track mode ───────────────────────────────────────────────────────
@@ -839,8 +901,9 @@ if __name__ == "__main__":
             raw_img       = sum(img.astype(np.float32) for img in event_imgs)
             true_momentum = truth_moms[:args.n_tracks]
             initial_momenta_cli = (
-                [reco_predict(reco, img, device) for img in event_imgs[:args.n_tracks]]
-                if reco else None
+                convex_hull_initial_guess(raw_img, n_tracks=args.n_tracks,
+                                          use_pmag_estimate=use_pmag)
+                if use_hull else None
             )
             run_name = args.run_name or (
                 f"{args.n_tracks}track_ev{ev_i}" + ("_l2" if args.loss == 'l2' else "")
@@ -867,6 +930,7 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                reparam_pmag=args.reparam_pmag,
             )
 
         if args.n_events > 1 and args.dataset:
@@ -1006,7 +1070,10 @@ if __name__ == "__main__":
             else:
                 print(f"Event {ev_i+1}/{args.n_events}")
 
-            initial_momenta_cli = [reco_predict(reco, raw_img, device)] if reco else None
+            initial_momenta_cli = (
+                convex_hull_initial_guess(raw_img, n_tracks=1, use_pmag_estimate=use_pmag)
+                if use_hull else None
+            )
 
             if args.run_name:
                 run_name = args.run_name if args.n_events == 1 else f"{args.run_name}_ev{ev_i}"
@@ -1035,4 +1102,5 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                reparam_pmag=args.reparam_pmag,
             )
