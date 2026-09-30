@@ -19,6 +19,7 @@ from helper_inference import (
     DifferentiableLDMGenerator,
     emd_loss_with_gradients,
     l2_loss_with_gradients,
+    unbalanced_emd_loss,
     get_loss_fn,
     LOSS_NAMES,
     convex_hull_initial_guess,
@@ -73,6 +74,13 @@ def _run_sgd_core(
     loss_type='emd',
     loss_fn=None,           # callable override; if set, takes precedence over loss_type
     reparam_pmag=False,     # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
+    newton_pz=False,        # if True, scale pz (or pmag) grad by diagonal Hessian inverse before stepping
+    renoise=0.0,            # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
+    renoise_truth_init=False,        # if True, seed z_clean from the truth image on the first step
+    renoise_truth_every_step=False,  # if True, always renoise from truth (never update z_clean)
+    renoise_schedule='constant',     # 'constant', 'lr' (track the LR schedule), 'linear', 'cosine'
+    renoise_min=0.0,                 # final renoise fraction for non-constant schedules
+    return_renoise_path=False,       # if True, also return the per-step t_renoise list
 ):
     """
     Gradient descent over N sets of (px, py, pz) simultaneously.
@@ -90,6 +98,7 @@ def _run_sgd_core(
                   or (px, py, pz) for N==1
     explore_path: list of bool (always False)
     lr_path     : list of float learning rates
+    renoise_path: list of int t_renoise per step (only if return_renoise_path=True)
     """
     if loss_fn is None:
         loss_fn = get_loss_fn(loss_type)
@@ -97,6 +106,46 @@ def _run_sgd_core(
     n_tracks = len(initial_momenta)
     SCALE    = 500.0
     target_img = target_img.to(device)
+
+    t_renoise = None
+    z_clean   = None
+    t_max     = generator.model.num_timesteps - 1
+
+    def _renoise_frac(iteration, lr):
+        """Renoise fraction for this iteration, decaying from `renoise` to `renoise_min`."""
+        if renoise_schedule in ('constant', 'fixed'):
+            return renoise
+        if renoise_schedule == 'lr':
+            # Map lr ∈ [lr_min, learning_rate] linearly onto [renoise_min, renoise]
+            span = learning_rate - lr_min
+            w = (lr - lr_min) / span if span > 0 else 1.0
+        elif renoise_schedule == 'linear':
+            w = 1.0 - iteration / max(1, n_iterations - 1)
+        elif renoise_schedule == 'cosine':
+            w = 0.5 * (1.0 + np.cos(np.pi * iteration / max(1, n_iterations - 1)))
+        else:
+            raise ValueError(f"Unknown renoise_schedule: {renoise_schedule!r}")
+        w = min(max(w, 0.0), 1.0)
+        return renoise_min + (renoise - renoise_min) * w
+
+    if renoise:
+        t_renoise = max(1, int(renoise * t_max))
+        if verbose:
+            sched_str = ("" if renoise_schedule in ('constant', 'fixed') else
+                         f", schedule={renoise_schedule} → renoise_min={renoise_min:.2f}")
+            print(f"[renoise] enabled: t_renoise={t_renoise} "
+                  f"(renoise={renoise:.2f} × {t_max}{sched_str})")
+        if renoise_truth_init or renoise_truth_every_step:
+            with torch.no_grad():
+                x_truth = target_img
+                if x_truth.ndim == 2:
+                    x_truth = x_truth.unsqueeze(0).unsqueeze(0)
+                z_clean = generator.model.get_first_stage_encoding(
+                    generator.model.encode_first_stage(x_truth)
+                )
+            if verbose:
+                tag = "every step" if renoise_truth_every_step else "first step only"
+                print(f"[renoise] z_clean initialised from truth image ({tag})")
 
     # Build N×3 learnable parameter groups: [px/SCALE, py/SCALE, |p|/SCALE]
     # Optimise |p| (total momentum magnitude) instead of pz.  pz is derived as
@@ -134,8 +183,8 @@ def _run_sgd_core(
         return g[2].item()
 
     def _make_opt(params):
-        if optimizer_type.lower() == 'adam':
-            return torch.optim.Adam(params, lr=learning_rate)
+        if optimizer_type.lower() in ('adam', 'adamw'):
+            return torch.optim.AdamW(params, lr=learning_rate)
         return torch.optim.SGD(params, lr=learning_rate)
 
     optimizers = [_make_opt(p) for p in params_list]
@@ -168,6 +217,7 @@ def _run_sgd_core(
     mom_path    = [_current_mom()]
     explore_path = [False]
     lr_path     = []
+    renoise_path = []   # t_renoise used at each SGD step (None when renoise disabled)
 
     best_loss    = init_loss
     best_momenta = mom_path[0]
@@ -189,6 +239,9 @@ def _run_sgd_core(
                     g['lr'] = lr_min
         current_lr = optimizers[0].param_groups[0]['lr']
 
+        if renoise:
+            t_renoise = max(1, int(_renoise_frac(iteration, current_lr) * t_max))
+
         for opt in optimizers:
             opt.zero_grad()
 
@@ -197,7 +250,8 @@ def _run_sgd_core(
             batches = [
                 generator(g[0] * SCALE, g[1] * SCALE,
                           _pz_derived(g, sign_pz_list[t]) * SCALE,
-                          batch_size=avg_grad_batch_size)
+                          batch_size=avg_grad_batch_size,
+                          z_clean=z_clean, t_renoise=t_renoise)
                 for t, g in enumerate(params_list)
             ]
             losses = torch.stack([
@@ -206,7 +260,23 @@ def _run_sgd_core(
                 )
                 for i in range(avg_grad_batch_size)
             ])
-            losses.mean().backward()
+            if newton_pz:
+                all_params_flat = [p for group in params_list for p in group]
+                grads_all = torch.autograd.grad(
+                    losses.mean(), all_params_flat, create_graph=True
+                )
+                for t, group in enumerate(params_list):
+                    for j, p in enumerate(group):
+                        g = grads_all[t * 3 + j]
+                        if j == 2:
+                            (h,) = torch.autograd.grad(g, p, retain_graph=True,
+                                                       allow_unused=True)
+                            # h is None when loss is locally linear in p (H=0); fall back to plain grad
+                            p.grad = (g / (h.abs() + 1e-6)).detach() if h is not None else g.detach()
+                        else:
+                            p.grad = g.detach()
+            else:
+                losses.mean().backward()
             best_idx = losses.detach().argmin().item()
             combined = sum(batches[t][best_idx] for t in range(n_tracks)).detach().cpu()
             current_loss = losses[best_idx].item()
@@ -214,14 +284,37 @@ def _run_sgd_core(
             gens = [
                 generator(g[0] * SCALE, g[1] * SCALE,
                           _pz_derived(g, sign_pz_list[t]) * SCALE,
-                          fixed_z=fixed_z)
+                          fixed_z=fixed_z,
+                          z_clean=z_clean, t_renoise=t_renoise)
                 for t, g in enumerate(params_list)
             ]
             combined = sum(gens)
             loss     = loss_fn(combined, target_img)
-            loss.backward()
+            if newton_pz:
+                all_params_flat = [p for group in params_list for p in group]
+                grads_all = torch.autograd.grad(loss, all_params_flat, create_graph=True)
+                for t, group in enumerate(params_list):
+                    for j, p in enumerate(group):
+                        g = grads_all[t * 3 + j]
+                        if j == 2:
+                            (h,) = torch.autograd.grad(g, p, retain_graph=True,
+                                                       allow_unused=True)
+                            # h is None when loss is locally linear in p (H=0); fall back to plain grad
+                            p.grad = (g / (h.abs() + 1e-6)).detach() if h is not None else g.detach()
+                        else:
+                            p.grad = g.detach()
+            else:
+                loss.backward()
             current_loss = loss.item()
             combined = combined.detach().cpu()
+
+        # Encode combined image to update z_clean for the next iteration
+        if t_renoise is not None and not renoise_truth_every_step:
+            with torch.no_grad():
+                x_prev = combined.to(device).unsqueeze(0).unsqueeze(0)
+                z_clean = generator.model.get_first_stage_encoding(
+                    generator.model.encode_first_stage(x_prev)
+                )
 
         # Per-track gradient clipping
         for group in params_list:
@@ -248,14 +341,16 @@ def _run_sgd_core(
         mom_path.append(current_mom)
         explore_path.append(False)
         lr_path.append(current_lr)
+        renoise_path.append(t_renoise)
 
         if verbose and ((iteration + 1) % 10 == 0 or iteration == 0):
             grad_info = "  ".join(
                 f"|g{i+1}|={torch.sqrt(sum(p.grad.data.norm()**2 for p in g if p.grad is not None)).item():.3f}"
                 for i, g in enumerate(params_list)
             )
+            t_info = f" | T={t_renoise}" if renoise else ""
             print(f"Iter {iteration+1:3d}: Loss={current_loss:.6f} | Best={best_loss:.6f} | "
-                  f"LR={current_lr:.4f} | {grad_info}")
+                  f"LR={current_lr:.4f}{t_info} | {grad_info}")
 
         if best_loss < min_distance:
             if verbose:
@@ -272,6 +367,8 @@ def _run_sgd_core(
             for i, m in enumerate(best_momenta):
                 print(f"Best track {i+1}: ({m[0]:.2f}, {m[1]:.2f}, {m[2]:.2f})")
 
+    if return_renoise_path:
+        return img_path, dist_path, mom_path, explore_path, lr_path, renoise_path
     return img_path, dist_path, mom_path, explore_path, lr_path
 
 
@@ -282,7 +379,7 @@ def _run_dual_proj_sgd(
     xz_target,
     initial_momentum,
     generator,
-    n_iterations=39,
+    n_iterations=40,
     learning_rate=0.1,
     lr_min=0.001,
     gradient_clip=1.0,
@@ -334,8 +431,8 @@ def _run_dual_proj_sgd(
             return pz_param.item()
     params = [px, py, pz_param]
 
-    if optimizer_type.lower() == 'adam':
-        opt = torch.optim.Adam(params, lr=learning_rate)
+    if optimizer_type.lower() in ('adam', 'adamw'):
+        opt = torch.optim.AdamW(params, lr=learning_rate)
     else:
         opt = torch.optim.SGD(params, lr=learning_rate)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_iterations, eta_min=lr_min)
@@ -421,7 +518,7 @@ def run_inference(
     dual_projection=False,
     xz_img=None,           # required when dual_projection=True
     # SGD hyperparameters
-    n_iterations=39,
+    n_iterations=40,
     learning_rate=0.1,
     lr_min=0.001,
     gradient_clip=1.0,
@@ -444,6 +541,13 @@ def run_inference(
     loss_type='emd', # string name resolved via get_loss_fn; ignored when loss_fn is set
     loss_fn=None,    # callable (generated_img, target_img) -> scalar; overrides loss_type
     reparam_pmag=False,  # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
+    newton_pz=False,     # if True, scale pz (or pmag) grad by diagonal Hessian inverse before stepping
+    init_pz=None,        # if set (float, MeV), override the pz component of every track's initial guess
+    renoise=0.0,         # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
+    renoise_truth_init=False,       # if True, seed first step's z_clean from the truth image
+    renoise_truth_every_step=False, # if True, always renoise from truth (never update z_clean)
+    renoise_schedule='constant',    # 'constant', 'lr' (track the LR schedule), 'linear', 'cosine'
+    renoise_min=0.0,                # final renoise fraction for non-constant schedules
 ):
     """
     Run gradient-guided LDM inference to recover proton momenta from a detector image.
@@ -476,7 +580,7 @@ def run_inference(
     min_distance : float
         Early-stopping EMD threshold.
     optimizer_type : str
-        'SGD' or 'adam'.
+        'SGD' or 'adamw'.
     avg_grad : bool
         Average gradients over a batch of stochastic LDM samples.
     avg_grad_batch_size : int
@@ -499,12 +603,30 @@ def run_inference(
         Generate and save diagnostic plots.
     loss_type : str
         Name of the loss function (resolved via get_loss_fn).  Supported values:
-        'emd'/'w1'/'sinkhorn' (default), 'w2'/'sinkhorn_p2', 'energy',
+        'emd'/'w1'/'sinkhorn' (default), 'unbal_emd'/'uemd' (unbalanced W1),
+        'w2'/'sinkhorn_p2', 'energy',
         'gaussian_mmd'/'gmmd', 'laplacian_mmd'/'lmmd', 'l2'/'mse'.
         Ignored when loss_fn is provided.
     loss_fn : callable or None
         Custom loss function with signature (generated_img, target_img) -> scalar tensor.
         When provided, overrides loss_type entirely.
+    newton_pz : bool
+        If True, replace the pz (or |p| when reparam_pmag=True) gradient with a
+        diagonal Newton step: g / (|d²L/dpz²| + 1e-6).  This amplifies weak pz
+        gradients by the local curvature, helping the optimizer move in the pz
+        direction even when d(loss)/d(pz) is small.  Costs one extra backward pass
+        per iteration.  Consider reducing avg_grad_batch_size if memory is tight.
+    renoise : float
+        Initial re-noise fraction [0, 1]; t_renoise = renoise × T_max.  0 disables.
+    renoise_schedule : str
+        How the re-noise fraction evolves over iterations, decaying from
+        `renoise` to `renoise_min`:
+        'constant' (default) / 'fixed' — fixed at `renoise`;
+        'lr'     — proportional to the current learning rate, mapping
+                   [lr_min, learning_rate] onto [renoise_min, renoise];
+        'linear' / 'cosine' — independent linear / cosine decay over n_iterations.
+    renoise_min : float
+        Final re-noise fraction for non-constant schedules.
 
     Returns
     -------
@@ -525,6 +647,9 @@ def run_inference(
     device = torch.device(device)
     if verbose:
         print(f"Device: {device}")
+
+    # Step 0 is saved as the initial image, so the loop runs n_iterations-1 SGD steps.
+    n_iterations = n_iterations - 1
 
     # Convert xy target to tensor
     if isinstance(target_img, np.ndarray):
@@ -559,6 +684,12 @@ def run_inference(
                 print(f"Random init: ({init_mom[0]:.1f}, {init_mom[1]:.1f}, {init_mom[2]:.1f})  |p|={mag:.1f}")
         else:
             init_mom = tuple(float(v) for v in init_mom)
+
+        if init_pz is not None:
+            init_mom = (init_mom[0], init_mom[1], float(init_pz))
+            if verbose:
+                print(f"[init_pz] pz overridden to {float(init_pz):.1f} MeV  "
+                      f"→ init ({init_mom[0]:.1f}, {init_mom[1]:.1f}, {init_mom[2]:.1f})")
 
         if generator is None:
             ldm = load_ldm(device)
@@ -645,6 +776,13 @@ def run_inference(
     else:
         initial_momenta = [tuple(float(v) for v in m) for m in initial_momenta]
 
+    if init_pz is not None:
+        initial_momenta = [(px, py, float(init_pz)) for px, py, _ in initial_momenta]
+        if verbose:
+            for i, (px, py, pz) in enumerate(initial_momenta):
+                print(f"[init_pz] track {i+1} pz overridden to {pz:.1f} MeV  "
+                      f"→ init ({px:.1f}, {py:.1f}, {pz:.1f})")
+
     # Load LDM (skip if caller passed a pre-loaded generator)
     if generator is None:
         ldm = load_ldm(device)
@@ -655,7 +793,7 @@ def run_inference(
         )
 
     # Run inference
-    img_path, dist_path, mom_path, explore_path, lr_path = _run_sgd_core(
+    img_path, dist_path, mom_path, explore_path, lr_path, renoise_path = _run_sgd_core(
         generator=generator,
         target_img=xy_tensor,
         initial_momenta=initial_momenta,
@@ -673,6 +811,13 @@ def run_inference(
         loss_type=loss_type,
         loss_fn=loss_fn,
         reparam_pmag=reparam_pmag,
+        newton_pz=newton_pz,
+        renoise=renoise,
+        renoise_truth_init=renoise_truth_init,
+        renoise_truth_every_step=renoise_truth_every_step,
+        renoise_schedule=renoise_schedule,
+        renoise_min=renoise_min,
+        return_renoise_path=True,
     )
 
     elapsed = time.time() - start_time
@@ -694,6 +839,8 @@ def run_inference(
     np.save(os.path.join(data_dir, "std_path.npy"),   np.array(lr_path))
     np.save(os.path.join(data_dir, "target_img.npy"), raw_xy)
     np.save(os.path.join(data_dir, "truth_mom.npy"),  np.array(true_momentum))
+    if renoise:
+        np.save(os.path.join(data_dir, "renoise_path.npy"), np.array(renoise_path))
     if verbose:
         print(f"Outputs saved to {data_dir}/")
 
@@ -710,6 +857,7 @@ def run_inference(
         'mom_path':     mom_path,
         'explore_path': explore_path,
         'lr_path':      lr_path,
+        'renoise_path': renoise_path,
         'data_dir':     data_dir,
         'plot_dir':     plot_dir,
         'elapsed':      elapsed,
@@ -782,12 +930,12 @@ if __name__ == "__main__":
     parser.add_argument('--no_plots', dest='save_plots', action='store_false', default=True)
 
     ## Inference hyperparameters
-    parser.add_argument('--n_iterations', type=int, default=39) # 40 starting from zero for nice grid, probably overkill
+    parser.add_argument('--n_iterations', type=int, default=40) # step 0 is included in output, so 40 yields 40 frames on a grid
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--lr_min', type=float, default=0.001)
     parser.add_argument('--gradient_clip', type=float, default=1.0)
     parser.add_argument('--min_distance', type=float, default=0.05)
-    parser.add_argument('--optimizer', type=str, default='SGD', choices=['SGD', 'adam'])
+    parser.add_argument('--optimizer', type=str, default='SGD', choices=['SGD', 'adam', 'adamw'])
     parser.add_argument('--avg_grad', action='store_true', default=True)
     parser.add_argument('--no_avg_grad', dest='avg_grad', action='store_false')
     parser.add_argument('--batch_size', type=int, default=32)
@@ -797,14 +945,35 @@ if __name__ == "__main__":
                         help="Use energy-based |p| estimator to initialise pmag (requires --use_hull)")
     parser.add_argument('--reparam_pmag', action='store_true', default=False,
                         help="Optimise (px, py, |p|) and derive pz instead of direct (px, py, pz)")
+    parser.add_argument('--newton_pz', action='store_true', default=False,
+                        help="Scale pz (or pmag) gradient by diagonal Hessian inverse; "
+                             "amplifies weak pz signal at the cost of one extra backward per step. "
+                             "Reduce --batch_size if memory is tight.")
+    parser.add_argument('--init_pz', type=float, default=None,
+                        help="Override the initial pz (MeV) for every track, replacing the hull/random guess. "
+                             "Useful to break the pz=0 saddle point (e.g. --init_pz 100).")
     parser.add_argument('--loss', type=str, default='emd', choices=LOSS_NAMES,
                         help=(
                             "Loss function (default: 'emd'). "
-                            "Options: emd/w1/sinkhorn (Wasserstein-1), w2/sinkhorn_p2 (Wasserstein-2), "
+                            "Options: emd/w1/sinkhorn (Wasserstein-1), "
+                            "unbal_emd/uemd (unbalanced Sinkhorn W1; tune with --uemd_blur/--uemd_reach), "
+                            "w2/sinkhorn_p2 (Wasserstein-2), "
                             "energy (energy distance), gaussian_mmd/gmmd, laplacian_mmd/lmmd, l2/mse"
                         ))
+    parser.add_argument('--uemd_blur', type=float, default=0.05,
+                        help="Entropic regularisation for unbal_emd (≈ POT reg); default: 0.05")
+    parser.add_argument('--uemd_reach', type=float, default=0.5,
+                        help="KL marginal penalty for unbal_emd (≈ POT reg_m); default: 0.5")
     
     args = parser.parse_args()
+
+    # Build a partial for unbalanced EMD so custom blur/reach flow to all calls
+    import functools
+    cli_loss_fn = None
+    if args.loss in ('unbal_emd', 'uemd'):
+        cli_loss_fn = functools.partial(
+            unbalanced_emd_loss, reg=args.uemd_blur, reg_m=args.uemd_reach
+        )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -889,7 +1058,10 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                loss_fn=cli_loss_fn,
                 reparam_pmag=args.reparam_pmag,
+                newton_pz=args.newton_pz,
+                init_pz=args.init_pz,
             )
 
     # ── Multi-track mode ───────────────────────────────────────────────────────
@@ -930,7 +1102,10 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                loss_fn=cli_loss_fn,
                 reparam_pmag=args.reparam_pmag,
+                newton_pz=args.newton_pz,
+                init_pz=args.init_pz,
             )
 
         if args.n_events > 1 and args.dataset:
@@ -1102,5 +1277,8 @@ if __name__ == "__main__":
                 generator=generator,
                 verbose=True,
                 loss_type=args.loss,
+                loss_fn=cli_loss_fn,
                 reparam_pmag=args.reparam_pmag,
+                newton_pz=args.newton_pz,
+                init_pz=args.init_pz,
             )
