@@ -1,3 +1,4 @@
+"""Per-event diagnostic plots: SGD image grids, evolution GIF, momentum/loss traces."""
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -677,3 +678,31 @@ if __name__ == "__main__":
                   "Run compute_loss_surface.py first.")
 
     print(f"\nAll plots saved to {plot_dir}/")
+
+
+# ── Per-event plot bundle (called by optimize.run_inference) ───────────────────
+
+def save_event_plots(img_path, dist_path, mom_path, lr_path,
+                     true_momentum, raw_img, n_tracks, plot_dir, verbose):
+    # truth_mom passed to plotting: single tuple for 1-track, pair-tuple for 2+
+    truth_mom_plot = true_momentum[0] if n_tracks == 1 else tuple(true_momentum)
+
+    plot_sgd_images(
+        img_path, dist_path, mom_path, lr_path, truth_mom_plot,
+        save_path=os.path.join(plot_dir, 'sgd_images.png'),
+        n_cols=5,
+    )
+    create_sgd_gif(
+        img_path, dist_path, mom_path, lr_path,
+        save_path=os.path.join(plot_dir, 'sgd_evolution.gif'),
+        fps=4, stride=1,
+    )
+    plot_sgd_results(dist_path, mom_path, truth_mom_plot, save_dir=plot_dir)
+    plot_initial_final(
+        img_path, dist_path, mom_path,
+        target_img=torch.tensor(raw_img),
+        truth_mom=truth_mom_plot,
+        save_path=os.path.join(plot_dir, 'initial_final.png'),
+    )
+    if verbose:
+        print(f"Plots saved to {plot_dir}/")

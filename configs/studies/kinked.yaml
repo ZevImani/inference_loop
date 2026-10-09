@@ -1,0 +1,7 @@
+# Single-track kinked events (.npz with 'images' / 'momenta'); top-64 kink-score events.
+# Other sizes: build with datasets/kinked_tracks/make_kinked_dataset.py --n-top N, then
+#   data.path=datasets/kinked_tracks/kinked_tracks_topN.npz
+# One specific event: event_offset=15 n_events=1
+study: kinked
+data:
+  path: ${paths.datasets.kinked}

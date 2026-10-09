@@ -1,0 +1,20 @@
+# Filesystem locations. Relative paths are resolved against the repo root;
+# ~ and $VARS are expanded. To use a different file without editing this one,
+# set PROTONINFER_PATHS=/path/to/my_paths.yaml.
+
+# latent-diffusion checkout. Only used as a fallback: added to sys.path if `ldm` isn't
+# importable. The ldm conda env (latent-diffusion/environment.yaml) already installs it.
+latent_diffusion_dir: /n/home11/zimani/latent-diffusion
+ldm_config: /n/home11/zimani/latent-diffusion/configs/latent-diffusion/protons64-ldm-kl.yaml
+ldm_checkpoint: /n/home11/zimani/latent-diffusion/edep_protons64_v2_ldm/runs/checkpoints/epoch=000075.ckpt
+
+# Root directory for study outputs (<output_dir>/<run_name>/...).
+output_dir: studies/results
+
+datasets:
+  val: /n/holystore01/LABS/iaifi_lab/Users/zimani/datasets/edep_protons64_v2/edep_val
+  dual_proj: /n/holystore01/LABS/iaifi_lab/Users/zimani/datasets/edep_protons64_xy_xz
+  angle_pairs: datasets/angle_dataset/angle_pairs_val.npy
+  pz_degeneracy: pz_degeneracy/pz_degeneracy_dataset/pz_degeneracy_dataset.npz
+  kinked: datasets/kinked_tracks/kinked_tracks_top64.npz
+  dual_kinked: datasets/kinked_tracks/dual_kinked_tracks_top64.npz

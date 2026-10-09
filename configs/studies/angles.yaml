@@ -1,0 +1,7 @@
+# Two-track events: n_events angle pairs, stratified across [angle_min, angle_max] degrees.
+study: angles
+data:
+  path: ${paths.datasets.angle_pairs}
+  angle_min: 0.0
+  angle_max: 30.0
+  seed: null        # RNG seed for choosing pairs within each angle bin

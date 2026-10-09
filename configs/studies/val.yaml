@@ -1,0 +1,4 @@
+# Single-track events from the edep_protons64_v2 validation set.
+study: val
+data:
+  path: ${paths.datasets.val}

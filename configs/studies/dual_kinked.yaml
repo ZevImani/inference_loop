@@ -1,0 +1,6 @@
+# Kinked tracks fit against both their xy and xz projections
+# (.npz with 'images' = xy, 'images_xz', 'momenta'); top-64 by xy kink angle.
+# Build: python datasets/kinked_tracks/make_kinked_dataset.py --dual-proj
+study: dual_kinked
+data:
+  path: ${paths.datasets.dual_kinked}

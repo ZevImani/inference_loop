@@ -1,0 +1,45 @@
+# Default inference hyperparameters (schema: protoninfer/config.py::InferenceConfig).
+# Override any key from the command line, e.g. optimizer.lr=0.05 renoise.frac=0.3
+# (prefix with `inference.` when running studies/run_study.py).
+
+n_iterations: 40          # frames in the output, including step 0
+min_distance: 0.05        # early-stop once the best loss drops below this
+
+optimizer:
+  name: adamw               # SGD | adam | adamw  (adam and adamw both use AdamW)
+  lr: 0.1                 # normalised units (momentum / 500)
+  lr_min: 0.001           # floor of the cosine LR schedule
+  gradient_clip: 1.0      # per-track gradient-norm clip
+  reparam_pmag: false     # optimise (px, py, |p|) and derive pz
+  newton_pz: false        # scale the pz (or |p|) grad by the inverse diagonal Hessian; costs one extra backward
+  fix_pz: false           # hold pz at its starting value; only px, py are optimised (pair with init.truth_pz)
+
+sampling:
+  avg_grad: true          # average the loss over a batch of stochastic LDM samples
+  batch_size: 32          # samples per step; reduce if GPU memory is tight with newton_pz
+  fixed_z: false          # reuse one latent noise vector (only when avg_grad is false)
+  ddim_steps_standard: 50 # DDIM steps for no-grad generation
+  ddim_steps_gradient: 10 # DDIM steps for gradient-enabled generation
+
+loss:
+  name: emd               # emd/w1/sinkhorn, unbal_emd/uemd, w2, energy, gaussian_mmd, laplacian_mmd, l2/mse
+  kwargs: {}              # passed to the loss, e.g. {reg: 0.05, reg_m: 0.5} for uemd
+
+init:
+  method: hull            # hull (falls back to random if the hull fails) | random
+  use_pmag: false         # set the hull guess's |p| from the image energy estimate
+  init_pz: null           # override every track's starting pz (MeV), e.g. 100 to leave the pz=0 saddle
+  truth_pz: false         # diagnostic: start every track at its true pz (applied after perturbations)
+  random_frac: 0.0        # with method=hull, fraction of events that use a random init instead
+  random_pmin: 100.0      # |p| range (MeV) for random inits
+  random_pmax: 500.0
+  pmag_scale: 1.0         # multiply every starting |p| by this (e.g. 0.8 to start low on purpose)
+  pmag_jitter: 0.0        # log-normal std of a random per-track |p| factor (0.1 ≈ ±10%)
+  angle_jitter_deg: 0.0   # std (deg) of a random 3D rotation of each starting direction; gives pz=0 guesses a pz
+
+renoise:
+  frac: 0.0               # re-noise fraction in [0, 1]: start each DDIM run from the previous image noised to frac*T_max; 0 disables
+  schedule: constant      # constant | fixed | lr (track the LR schedule) | linear | cosine
+  min: 0.1                # final fraction for non-constant schedules
+  truth_init: false       # seed the first step's latent from the truth image
+  truth_every_step: false # always renoise from the truth latent

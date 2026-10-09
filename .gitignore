@@ -1,5 +1,17 @@
+# Python
 __pycache__/
+*.egg-info/
+
+# Generated outputs
 *.png
 *.gif
 *.npy
-*.pt 
+*.npz
+*.pt
+*.ckpt
+*.log
+
+# Run outputs
+studies/results/
+studies/logs/
+inference_results/

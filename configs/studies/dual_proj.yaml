@@ -1,0 +1,5 @@
+# Single track fit against both its xy and xz projections
+# (batch_N.npy, batch_xz_N.npy, batch_mom_N.npy).
+study: dual_proj
+data:
+  path: ${paths.datasets.dual_proj}

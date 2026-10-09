@@ -1,0 +1,6 @@
+# One subset of the pz-degeneracy dataset.
+# which: ref = real events with |pz| > 100 MeV/c; pz0 = their MCMC-found pz=0 counterparts
+study: pzdeg
+data:
+  path: ${paths.datasets.pz_degeneracy}
+  which: ref

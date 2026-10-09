@@ -1,0 +1,4 @@
+# Both pz-degeneracy subsets (ref, then pz0), with two-colour summary plots.
+study: pzboth
+data:
+  path: ${paths.datasets.pz_degeneracy}
