@@ -11,6 +11,6 @@ from protoninfer.initial_guess import (  # noqa: F401
 from protoninfer.losses import (  # noqa: F401
     LOSS_NAMES, _LOSS_REGISTRY, _get_cost_matrix, _prepare_distributions, emd_loss_with_gradients,
     energy_distance_loss, gaussian_mmd_loss, get_loss_fn, l2_loss_with_gradients, laplacian_mmd_loss,
-    unbalanced_emd_loss, wasserstein2_loss,
+    sliced_wasserstein_loss, unbalanced_emd_loss, wasserstein2_loss,
 )
 from protoninfer.model import BACKGROUND_THRESHOLD, DifferentiableLDMGenerator, decode_first_stage_with_grad  # noqa: F401

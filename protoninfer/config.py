@@ -19,7 +19,7 @@ from .losses import get_loss_fn
 
 OPTIMIZERS        = ('SGD', 'adam', 'adamw')
 INIT_METHODS      = ('hull', 'random')
-RENOISE_SCHEDULES = ('constant', 'fixed', 'lr', 'linear', 'cosine')
+RENOISE_SCHEDULES = ('constant', 'fixed', 'lr', 'step', 'linear', 'cosine')
 
 
 def _check_choice(name, value, choices):
@@ -86,13 +86,20 @@ class InitConfig:
 @dataclass
 class RenoiseConfig:
     frac: float = 0.0              # re-noise fraction in [0, 1]; 0 disables
-    schedule: str = 'constant'     # constant | fixed | lr | linear | cosine
+    schedule: str = 'constant'     # constant | fixed | lr | step | linear | cosine
     min: float = 0.1               # final fraction for non-constant schedules
+    step_ref: float = 50.0         # schedule=step: previous-step |Δp| (MeV) that maps to the full frac
     truth_init: bool = False       # seed the first step's latent from the truth image
     truth_every_step: bool = False # always renoise from the truth latent
+    scale_steps: bool = False      # scale the gradient DDIM steps with the renoise level (keeps step spacing)
+    min_steps: int = 2             # floor on the scaled DDIM steps (2 = one DDIM update)
 
     def __post_init__(self):
         _check_choice('renoise.schedule', self.schedule, RENOISE_SCHEDULES)
+        if self.step_ref <= 0:
+            raise ValueError(f"renoise.step_ref={self.step_ref}; expected a positive value (MeV)")
+        if self.min_steps < 2:
+            raise ValueError(f"renoise.min_steps={self.min_steps}; expected >= 2")
 
 
 @dataclass
@@ -133,8 +140,11 @@ class InferenceConfig:
             renoise                  = self.renoise.frac,
             renoise_schedule         = self.renoise.schedule,
             renoise_min              = self.renoise.min,
+            renoise_step_ref         = self.renoise.step_ref,
             renoise_truth_init       = self.renoise.truth_init,
             renoise_truth_every_step = self.renoise.truth_every_step,
+            renoise_scale_steps      = self.renoise.scale_steps,
+            renoise_min_steps        = self.renoise.min_steps,
         )
 
 

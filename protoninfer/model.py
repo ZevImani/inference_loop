@@ -21,10 +21,18 @@ def load_ldm(device, config_path=None, checkpoint_path=None):
         checkpoint_path = checkpoint_path or resolve_path(paths.ldm_checkpoint)
     print("Loading LDM...")
     config = OmegaConf.load(config_path)
+    # The LDM checkpoint already holds the autoencoder weights, so don't load the (machine-local)
+    # autoencoder checkpoint named in the config; the check below confirms nothing is left unloaded.
+    config.model.params.first_stage_config.params.ckpt_path = None
     pl_sd  = torch.load(checkpoint_path, map_location="cpu")
     ldm    = instantiate_from_config(config.model)
-    ldm.load_state_dict(pl_sd["state_dict"], strict=False)
+    missing, _ = ldm.load_state_dict(pl_sd["state_dict"], strict=False)
+    if missing:
+        raise RuntimeError(f"{checkpoint_path} is missing {len(missing)} LDM weights, e.g. {missing[:5]}")
     ldm.to(device).eval()
+    # Inference only optimises momentum, so freeze the weights: backward then skips
+    # the weight gradients (and their .grad buffers) and only flows to the inputs.
+    ldm.requires_grad_(False)
     print("LDM loaded.\n")
     return ldm
 
@@ -51,7 +59,8 @@ class DifferentiableLDMGenerator:
         self.sampler = DDIMSampler(model)
         self._fixed_z = None  # cached noise vector, allocated on first use with fixed_z=True
 
-    def __call__(self, px, py, pz, batch_size=1, fixed_z=False, z_clean=None, t_renoise=None):
+    def __call__(self, px, py, pz, batch_size=1, fixed_z=False, z_clean=None, t_renoise=None,
+                 renoise_steps=None):
         """
         Generate image from momentum.
         Automatically detects if gradients are needed based on input tensors.
@@ -69,6 +78,8 @@ class DifferentiableLDMGenerator:
                         instead of from pure Gaussian noise.
             t_renoise:  Integer diffusion timestep to which z_clean is noised before
                         DDIM denoising begins.  Ignored when z_clean is None.
+            renoise_steps: DDIM steps for the renoise chain (t_renoise → 0).  None uses
+                        ddim_steps_gradient.  Ignored unless z_clean and t_renoise are set.
 
         Returns:
             Generated image: [H, W] for batch_size=1, [B, H, W] for batch_size>1
@@ -98,7 +109,8 @@ class DifferentiableLDMGenerator:
 
         if needs_grad:
             return self._generate_with_gradients(momentum_norm, batch_size=batch_size, fixed_z=fixed_z,
-                                                  z_clean=z_clean, t_renoise=t_renoise)
+                                                  z_clean=z_clean, t_renoise=t_renoise,
+                                                  renoise_steps=renoise_steps)
         else:
             return self._generate_standard(momentum_norm)
 
@@ -128,7 +140,7 @@ class DifferentiableLDMGenerator:
             return result
 
     def _generate_with_gradients(self, momentum_norm, batch_size=1, fixed_z=False,
-                                 z_clean=None, t_renoise=None):
+                                 z_clean=None, t_renoise=None, renoise_steps=None):
         """
         Gradient-enabled generation using multi-step DDIM.
         Gradients flow through conditioning → apply_model → DDIM → VAE decode.
@@ -139,6 +151,7 @@ class DifferentiableLDMGenerator:
                                       Returns [batch_size, H, W].
         z_clean + t_renoise         : each sample independently noises z_clean to t_renoise
                                       and starts DDIM there; takes priority over fixed_z.
+                                      renoise_steps (if set) replaces ddim_steps_gradient.
         """
         conditioning = self.model.get_learned_conditioning(momentum_norm)
 
@@ -147,6 +160,7 @@ class DifferentiableLDMGenerator:
             self.model.model.diffusion_model.image_size,
             self.model.model.diffusion_model.image_size
         ]
+        n_steps = self.ddim_steps_gradient
 
         if z_clean is not None and t_renoise is not None:
             # Renoise path: noise z_clean independently per sample, start DDIM from t_renoise
@@ -157,6 +171,8 @@ class DifferentiableLDMGenerator:
             conditioning_in = (conditioning.expand(batch_size, *conditioning.shape[1:])
                                if batch_size > 1 else conditioning)
             t_start = int(t_renoise)
+            if renoise_steps is not None:
+                n_steps = renoise_steps
         elif batch_size > 1:
             z = torch.randn([batch_size] + shape, device=self.device)
             conditioning_in = conditioning.expand(batch_size, *conditioning.shape[1:])
@@ -173,7 +189,7 @@ class DifferentiableLDMGenerator:
             t_start = self.model.num_timesteps - 1
 
         timesteps = torch.linspace(
-            t_start, 0, self.ddim_steps_gradient,
+            t_start, 0, n_steps,
             dtype=torch.long, device=self.device
         )
 
@@ -191,9 +207,7 @@ class DifferentiableLDMGenerator:
                 z       = alpha_t_next.sqrt() * pred_x0 + dir_xt
 
         decoded = decode_first_stage_with_grad(self.model, z)
-        if batch_size == 1:
-            result = decoded.squeeze()
-            return torch.nn.functional.relu(result - BACKGROUND_THRESHOLD)
-        else:
-            result = decoded.squeeze(1)  # [B, H, W]
-            return torch.nn.functional.relu(result - BACKGROUND_THRESHOLD)
+        result = decoded.squeeze() if batch_size == 1 else decoded.squeeze(1)  # [H, W] or [B, H, W]
+        # Hard threshold matching _generate_standard; the mask is constant, so gradients
+        # pass through unchanged for kept pixels and are zero for background pixels.
+        return result * (result >= BACKGROUND_THRESHOLD)

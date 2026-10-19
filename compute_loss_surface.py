@@ -29,27 +29,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ── Path setup ─────────────────────────────────────────────────────────────────
-sys.path.append('/n/home11/zimani/reco_model/')
-sys.path.append('/n/home11/zimani/latent-diffusion')
-sys.path.append('/n/home11/zimani/inference_loop')
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from omegaconf import OmegaConf
-from ldm.util import instantiate_from_config
+# LDM code comes from the latent-diffusion submodule; config/checkpoint from configs/paths.yaml
 from helper_inference import DifferentiableLDMGenerator, emd_loss_with_gradients
-
-LDM_CONFIG_PATH     = "/n/home11/zimani/latent-diffusion/configs/latent-diffusion/protons64-ldm-kl.yaml"
-LDM_CHECKPOINT_PATH = "/n/home11/zimani/latent-diffusion/edep_protons64_v2_ldm/runs/checkpoints/epoch=000075.ckpt"
-
-
-# ── Model loader ───────────────────────────────────────────────────────────────
-
-def _load_ldm(device):
-    config = OmegaConf.load(LDM_CONFIG_PATH)
-    pl_sd  = torch.load(LDM_CHECKPOINT_PATH, map_location="cpu")
-    ldm    = instantiate_from_config(config.model)
-    ldm.load_state_dict(pl_sd["state_dict"], strict=False)
-    ldm.to(device).eval()
-    return ldm
+from protoninfer.model import load_ldm as _load_ldm
 
 
 # ── Core grid sweep ────────────────────────────────────────────────────────────

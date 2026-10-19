@@ -39,7 +39,10 @@ init:
 
 renoise:
   frac: 0.0               # re-noise fraction in [0, 1]: start each DDIM run from the previous image noised to frac*T_max; 0 disables
-  schedule: constant      # constant | fixed | lr (track the LR schedule) | linear | cosine
+  schedule: constant      # constant | fixed | lr (track the LR schedule) | step (track the last |Δp|) | linear | cosine
   min: 0.1                # final fraction for non-constant schedules
+  step_ref: 50.0          # schedule=step: previous-step |Δp| (MeV) that maps to the full frac; bigger steps saturate
   truth_init: false       # seed the first step's latent from the truth image
   truth_every_step: false # always renoise from the truth latent
+  scale_steps: false      # use ~ddim_steps_gradient*frac DDIM steps for the shorter renoised chain (same step spacing)
+  min_steps: 2            # floor on the scaled DDIM steps (2 = one DDIM update)

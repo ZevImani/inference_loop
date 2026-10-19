@@ -150,7 +150,7 @@ Hyperparameters are defined as typed dataclasses in [`protoninfer/config.py`](pr
 | `sampling` | `avg_grad`, `batch_size`, `fixed_z`, `ddim_steps_standard`, `ddim_steps_gradient` |
 | `loss` | `name` (emd, unbal_emd, w2, energy, gaussian_mmd, laplacian_mmd, l2), `kwargs` |
 | `init` | `method` (hull / random), `use_pmag`, `init_pz` |
-| `renoise` | `frac`, `schedule`, `min`, `truth_init`, `truth_every_step` |
+| `renoise` | `frac`, `schedule`, `min`, `step_ref`, `truth_init`, `truth_every_step`, `scale_steps`, `min_steps` |
 
 Override any setting on the command line with dotted `key=value` pairs:
 
@@ -169,7 +169,7 @@ python studies/run_study.py -c val n_events=128 run_name=val128_default
 python studies/run_study.py -c kinked n_events=64 inference.renoise.frac=0.3
 python studies/run_study.py -c angles n_events=100 data.angle_max=25
 python studies/run_study.py -c pzdeg data.which=pz0 --print_config   # show the merged config and exit
-python studies/run_study.py --plot_only run_name=val128_default      # redraw summary plots only
+python studies/run_study.py --plot_only  run_name=val128_default      # redraw summary plots only
 ```
 
 `-c` takes either a path to a YAML file or the name of a file in [`configs/studies/`](configs/studies/). Settings are applied in this order, with later ones winning:

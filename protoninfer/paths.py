@@ -1,5 +1,4 @@
 """Filesystem locations (LDM checkpoint, datasets, output root), read from configs/paths.yaml."""
-import importlib.util
 import os
 import sys
 
@@ -25,9 +24,20 @@ def resolve_path(p):
 
 
 def ensure_ldm_importable(paths=None):
-    """Put latent_diffusion_dir on sys.path if the `ldm` package isn't already importable."""
-    if importlib.util.find_spec('ldm') is not None:
+    """Make `ldm` import from latent_diffusion_dir (the submodule), ahead of any installed copy."""
+    ldm_dir = os.path.realpath(resolve_path((paths or load_paths()).latent_diffusion_dir))
+    if not os.path.isdir(os.path.join(ldm_dir, 'ldm')):
+        raise FileNotFoundError(
+            f"No ldm package in {ldm_dir}; run `git submodule update --init` "
+            f"or set latent_diffusion_dir in configs/paths.yaml")
+    # ldm is a namespace package (no __init__.py), merged from every ldm/ dir on sys.path and
+    # searched in sys.path order, so being first is what makes the submodule's modules win.
+    if 'ldm' in sys.modules:
+        loaded = os.path.realpath(os.path.dirname(list(sys.modules['ldm'].__path__)[0]))
+        if loaded != ldm_dir:
+            raise ImportError(f"ldm was already imported from {loaded}, not {ldm_dir}; "
+                              f"import protoninfer before ldm")
         return
-    ldm_dir = resolve_path((paths or load_paths()).latent_diffusion_dir)
-    if ldm_dir not in sys.path:
-        sys.path.append(ldm_dir)
+    if ldm_dir in sys.path:
+        sys.path.remove(ldm_dir)
+    sys.path.insert(0, ldm_dir)

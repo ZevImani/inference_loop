@@ -195,6 +195,64 @@ def laplacian_mmd_loss(generated_img, target_img, blur=5.0):
     return SamplesLoss("laplacian", blur=blur)(gen_w, all_pos, tgt_w, all_pos)
 
 
+_sw_cache: dict = {}
+
+
+def _get_sw_projections(H, W, n_proj, device):
+    """Build and cache the per-angle pixel sort order and sorted-coordinate gaps."""
+    key = (H, W, n_proj, str(device))
+    if key not in _sw_cache:
+        with torch.no_grad():
+            ys = torch.arange(H, dtype=torch.float32, device=device)
+            xs = torch.arange(W, dtype=torch.float32, device=device)
+            gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+            pos = torch.stack([gy.flatten(), gx.flatten()], dim=1)          # [N, 2]
+            theta = torch.arange(n_proj, dtype=torch.float32, device=device) * torch.pi / n_proj
+            dirs = torch.stack([theta.sin(), theta.cos()], dim=1)          # [L, 2]
+            proj_sorted, order = (dirs @ pos.T).sort(dim=1)                # [L, N]
+            _sw_cache[key] = (order, proj_sorted.diff(dim=1))              # gaps: [L, N-1]
+    return _sw_cache[key]
+
+
+def sliced_wasserstein_loss(generated_img, target_img, n_proj=64):
+    """
+    Sliced Wasserstein-1 between images treated as normalized mass distributions
+    over the pixel grid, maintaining gradients through generated_img.
+
+    Each image is projected onto n_proj fixed, evenly spaced directions in
+    [0, π); the 1D W1 on each line is ∫|F_gen − F_tgt|, and the loss is the mean
+    over directions.  Because the support (pixel grid) is fixed, the sort order
+    of projected coordinates is precomputed once, so each call is one gather +
+    cumsum — no Sinkhorn iterations, no N×N cost matrix.  Angles are
+    deterministic so the loss is not stochastic (important for MCMC acceptance).
+
+    Not numerically comparable to emd_loss_with_gradients: SW1 ≤ W1 (≈ 2/π · W1
+    for a pure translation), so temperatures/step sizes tuned on EMD need rescaling.
+
+    Accepts [H, W] (returns a scalar) or batched [B, H, W] (returns [B]); a
+    single target is broadcast against a batch of generated images.
+
+    Parameters
+    ----------
+    n_proj : int — number of projection directions; default 64
+    """
+    gen = generated_img.reshape(-1, *generated_img.shape[-2:])
+    tgt = target_img.detach().reshape(-1, *target_img.shape[-2:])
+    B, H, W = gen.shape
+
+    tgt_sum = tgt.flatten(1).sum(1, keepdim=True)
+    if (tgt_sum == 0).all():
+        return torch.zeros(B, device=gen.device, requires_grad=True).squeeze(0)
+
+    order, gaps = _get_sw_projections(H, W, n_proj, gen.device)
+    gen_w = gen.flatten(1) / (gen.flatten(1).sum(1, keepdim=True) + 1e-8)
+    tgt_w = tgt.flatten(1) / (tgt_sum + 1e-8)
+
+    cdf_diff = (gen_w - tgt_w)[:, order].cumsum(-1)[..., :-1]              # [B, L, N-1]
+    sw = (cdf_diff.abs() * gaps).sum(-1).mean(-1)                          # [B]
+    return sw.squeeze(0) if generated_img.ndim == 2 else sw
+
+
 def l2_loss_with_gradients(generated_img, target_img):
     """
     Mean squared error between generated and target images.
@@ -220,6 +278,9 @@ _LOSS_REGISTRY = {
     'gmmd':          gaussian_mmd_loss,
     'laplacian_mmd': laplacian_mmd_loss,
     'lmmd':          laplacian_mmd_loss,
+    'sliced_w':      sliced_wasserstein_loss,
+    'sw':            sliced_wasserstein_loss,
+    'swd':           sliced_wasserstein_loss,
     'l2':            l2_loss_with_gradients,
     'mse':           l2_loss_with_gradients,
 }
@@ -234,7 +295,8 @@ def get_loss_fn(name_or_callable):
     Supported names: 'emd'/'w1'/'sinkhorn' (POT sinkhorn2, param: reg),
                      'unbal_emd'/'uemd' (POT sinkhorn_unbalanced2, params: reg, reg_m),
                      'w2'/'sinkhorn_p2', 'energy',
-                     'gaussian_mmd'/'gmmd', 'laplacian_mmd'/'lmmd', 'l2'/'mse'.
+                     'gaussian_mmd'/'gmmd', 'laplacian_mmd'/'lmmd',
+                     'sliced_w'/'sw'/'swd' (param: n_proj), 'l2'/'mse'.
 
     A callable is returned unchanged, so callers can pass in custom functions.
     """

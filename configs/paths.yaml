@@ -2,10 +2,14 @@
 # ~ and $VARS are expanded. To use a different file without editing this one,
 # set PROTONINFER_PATHS=/path/to/my_paths.yaml.
 
-# latent-diffusion checkout. Only used as a fallback: added to sys.path if `ldm` isn't
-# importable. The ldm conda env (latent-diffusion/environment.yaml) already installs it.
-latent_diffusion_dir: /n/home11/zimani/latent-diffusion
-ldm_config: /n/home11/zimani/latent-diffusion/configs/latent-diffusion/protons64-ldm-kl.yaml
+# LDM code and model config come from the latent-diffusion submodule
+# (git clone --recurse-submodules, or git submodule update --init). The submodule is put
+# first on sys.path, so it is used even if another latent-diffusion is pip-installed.
+latent_diffusion_dir: latent-diffusion
+ldm_config: latent-diffusion/configs/latent-diffusion/protons64-ldm-kl.yaml
+
+# Trained LDM checkpoint: not in git, download it and point this at your copy. It holds the
+# autoencoder weights too, so the autoencoder ckpt_path in ldm_config is not needed.
 ldm_checkpoint: /n/home11/zimani/latent-diffusion/edep_protons64_v2_ldm/runs/checkpoints/epoch=000075.ckpt
 
 # Root directory for study outputs (<output_dir>/<run_name>/...).

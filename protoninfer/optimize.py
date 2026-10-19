@@ -21,14 +21,23 @@ from .plotting import save_event_plots
 # ── Core SGD (generalized to N tracks) ────────────────────────────────────────
 
 def _renoise_fraction(renoise, renoise_min, schedule, iteration, n_iterations,
-                      lr, learning_rate, lr_min):
-    """Renoise fraction for this iteration, decaying from `renoise` to `renoise_min`."""
+                      lr, learning_rate, lr_min, step=None, step_ref=50.0):
+    """
+    Renoise fraction for this iteration, decaying from `renoise` to `renoise_min`.
+
+    For schedule='step', `step` is the momentum displacement (MeV) of the previous
+    gradient update; the fraction scales linearly with it and reaches `renoise` at
+    `step_ref`.  step=None (no update taken yet) gives the full `renoise`.
+    """
     if schedule in ('constant', 'fixed'):
         return renoise
     if schedule == 'lr':
         # Map lr ∈ [lr_min, learning_rate] linearly onto [renoise_min, renoise]
         span = learning_rate - lr_min
         w = (lr - lr_min) / span if span > 0 else 1.0
+    elif schedule == 'step':
+        # Big step → previous image is far from the new momentum → noise it further
+        w = 1.0 if step is None else step / step_ref
     elif schedule == 'linear':
         w = 1.0 - iteration / max(1, n_iterations - 1)
     elif schedule == 'cosine':
@@ -37,6 +46,23 @@ def _renoise_fraction(renoise, renoise_min, schedule, iteration, n_iterations,
         raise ValueError(f"Unknown renoise_schedule: {schedule!r}")
     w = min(max(w, 0.0), 1.0)
     return renoise_min + (renoise - renoise_min) * w
+
+
+def _renoise_ddim_steps(t_renoise, t_max, full_steps, min_steps):
+    """
+    DDIM steps for a renoise chain t_renoise → 0 that keeps the full chain's timestep
+    spacing: the full T_max → 0 chain has full_steps-1 intervals, so a chain starting
+    at t_renoise gets ceil((full_steps-1) · t_renoise / t_max) of them, clipped to
+    [min_steps, full_steps] steps.
+    """
+    n_intervals = int(np.ceil((full_steps - 1) * t_renoise / t_max))
+    return min(full_steps, max(min_steps, n_intervals + 1))
+
+
+def _momentum_step(prev_mom, cur_mom):
+    """Largest per-track |Δp| (MeV) between two mom_path entries (single or multi-track)."""
+    delta = np.asarray(cur_mom, dtype=float).reshape(-1, 3) - np.asarray(prev_mom, dtype=float).reshape(-1, 3)
+    return float(np.linalg.norm(delta, axis=1).max())
 
 
 def _encode_latent(generator, img, device):
@@ -69,8 +95,11 @@ def _run_sgd_core(
     renoise=0.0,            # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
     renoise_truth_init=False,        # if True, seed z_clean from the truth image on the first step
     renoise_truth_every_step=False,  # if True, always renoise from truth (never update z_clean)
-    renoise_schedule='constant',     # 'constant', 'lr' (track the LR schedule), 'linear', 'cosine'
+    renoise_schedule='constant',     # 'constant', 'lr' (track the LR schedule), 'step' (track |Δp|), 'linear', 'cosine'
     renoise_min=0.0,                 # final renoise fraction for non-constant schedules
+    renoise_step_ref=50.0,           # 'step' schedule: |Δp| (MeV) at which the fraction reaches `renoise`
+    renoise_scale_steps=False,       # if True, scale the gradient DDIM steps with t_renoise / T_max
+    renoise_min_steps=2,             # floor on the scaled DDIM steps
     return_renoise_path=False,       # if True, also return the per-step t_renoise list
 ):
     """
@@ -104,15 +133,27 @@ def _run_sgd_core(
     z_clean   = None
     t_max     = generator.model.num_timesteps - 1
 
-    def _renoise_frac(iteration, lr):
+    renoise_steps = None
+
+    def _renoise_frac(iteration, lr, step):
         return _renoise_fraction(renoise, renoise_min, renoise_schedule, iteration, n_iterations,
-                                 lr, learning_rate, lr_min)
+                                 lr, learning_rate, lr_min, step, renoise_step_ref)
+
+    def _steps_for(t):
+        if not renoise_scale_steps:
+            return None
+        return _renoise_ddim_steps(t, t_max, generator.ddim_steps_gradient, renoise_min_steps)
 
     if renoise:
         t_renoise = max(1, int(renoise * t_max))
         if verbose:
             sched_str = ("" if renoise_schedule in ('constant', 'fixed') else
                          f", schedule={renoise_schedule} → renoise_min={renoise_min:.2f}")
+            if renoise_schedule == 'step':
+                sched_str += f", step_ref={renoise_step_ref:.1f} MeV"
+            if renoise_scale_steps:
+                sched_str += (f", ddim_steps={_steps_for(t_renoise)}/{generator.ddim_steps_gradient}"
+                              f" (min {renoise_min_steps})")
             print(f"[renoise] enabled: t_renoise={t_renoise} "
                   f"(renoise={renoise:.2f} × {t_max}{sched_str})")
         if renoise_truth_init or renoise_truth_every_step:
@@ -220,8 +261,11 @@ def _run_sgd_core(
                     g['lr'] = lr_min
         current_lr = optimizers[0].param_groups[0]['lr']
 
+        # |Δp| of the update just taken: mom_path[-1] is the momentum before it
+        step = _momentum_step(mom_path[-1], _current_mom()) if iteration > 0 else None
         if renoise:
-            t_renoise = max(1, int(_renoise_frac(iteration, current_lr) * t_max))
+            t_renoise = max(1, int(_renoise_frac(iteration, current_lr, step) * t_max))
+            renoise_steps = _steps_for(t_renoise)
 
         for opt in optimizers:
             opt.zero_grad()
@@ -232,7 +276,8 @@ def _run_sgd_core(
                 generator(g[0] * SCALE, g[1] * SCALE,
                           _pz_derived(g, sign_pz_list[t]) * SCALE,
                           batch_size=avg_grad_batch_size,
-                          z_clean=z_clean, t_renoise=t_renoise)
+                          z_clean=z_clean, t_renoise=t_renoise,
+                          renoise_steps=renoise_steps)
                 for t, g in enumerate(params_list)
             ]
             losses = torch.stack([
@@ -266,7 +311,8 @@ def _run_sgd_core(
                 generator(g[0] * SCALE, g[1] * SCALE,
                           _pz_derived(g, sign_pz_list[t]) * SCALE,
                           fixed_z=fixed_z,
-                          z_clean=z_clean, t_renoise=t_renoise)
+                          z_clean=z_clean, t_renoise=t_renoise,
+                          renoise_steps=renoise_steps)
                 for t, g in enumerate(params_list)
             ]
             combined = sum(gens)
@@ -297,6 +343,9 @@ def _run_sgd_core(
                     generator.model.encode_first_stage(x_prev)
                 )
 
+        # Record the momentum that produced current_loss, before the optimizer moves it
+        current_mom = _current_mom()
+
         # Per-track gradient clipping
         for group in params_list:
             grad_norm = torch.sqrt(
@@ -312,7 +361,6 @@ def _run_sgd_core(
             opt.step()
             sched.step()
 
-        current_mom = _current_mom()
         if current_loss < best_loss:
             best_loss    = current_loss
             best_momenta = current_mom
@@ -330,6 +378,10 @@ def _run_sgd_core(
                 for i, g in enumerate(params_list)
             )
             t_info = f" | T={t_renoise}" if renoise else ""
+            if renoise_steps is not None and z_clean is not None:
+                t_info += f" ({renoise_steps} DDIM)"
+            if renoise and step is not None:
+                t_info += f" (|Δp|={step:.1f})"
             print(f"Iter {iteration+1:3d}: Loss={current_loss:.6f} | Best={best_loss:.6f} | "
                   f"LR={current_lr:.4f}{t_info} | {grad_info}")
 
@@ -377,6 +429,9 @@ def _run_dual_proj_sgd(
     renoise_truth_every_step=False,
     renoise_schedule='constant',
     renoise_min=0.0,
+    renoise_step_ref=50.0,
+    renoise_scale_steps=False,
+    renoise_min_steps=2,
     verbose=True,
 ):
     """
@@ -442,14 +497,25 @@ def _run_dual_proj_sgd(
         xz0 = generator(_px_v, _pz_v, _py_v)
         init_loss = (loss_fn(xy0, xy_target) + loss_fn(xz0, xz_target)).item()
 
-    t_renoise    = None
-    z_xy = z_xz  = None
-    t_max        = generator.model.num_timesteps - 1
+    t_renoise     = None
+    renoise_steps = None
+    z_xy = z_xz   = None
+    t_max         = generator.model.num_timesteps - 1
+
+    def _steps_for(t):
+        if not renoise_scale_steps:
+            return None
+        return _renoise_ddim_steps(t, t_max, generator.ddim_steps_gradient, renoise_min_steps)
+
     if renoise:
         if verbose:
+            t0 = max(1, int(renoise * t_max))
             sched_str = ("" if renoise_schedule in ('constant', 'fixed') else
                          f", schedule={renoise_schedule} → renoise_min={renoise_min:.2f}")
-            print(f"[renoise] enabled: t_renoise={max(1, int(renoise * t_max))} "
+            if renoise_scale_steps:
+                sched_str += (f", ddim_steps={_steps_for(t0)}/{generator.ddim_steps_gradient}"
+                              f" (min {renoise_min_steps})")
+            print(f"[renoise] enabled: t_renoise={t0} "
                   f"(renoise={renoise:.2f} × {t_max}{sched_str})")
         if renoise_truth_init or renoise_truth_every_step:
             z_xy = _encode_latent(generator, xy_target, device)
@@ -470,19 +536,24 @@ def _run_dual_proj_sgd(
         current_lr = opt.param_groups[0]['lr']
 
         if renoise:
+            # |Δp| of the update just taken: mom_path[-1] is the momentum before it
+            step = _momentum_step(mom_path[-1], _mom()) if iteration > 0 else None
             t_renoise = max(1, int(_renoise_fraction(
                 renoise, renoise_min, renoise_schedule, iteration, n_iterations,
-                current_lr, learning_rate, lr_min) * t_max))
+                current_lr, learning_rate, lr_min, step, renoise_step_ref) * t_max))
+            renoise_steps = _steps_for(t_renoise)
 
         opt.zero_grad()
 
         pz_t     = _pz_n() * SCALE
         xy_batch = generator(px * SCALE, py * SCALE, pz_t,
                              batch_size=avg_grad_batch_size,
-                             z_clean=z_xy, t_renoise=t_renoise)
+                             z_clean=z_xy, t_renoise=t_renoise,
+                             renoise_steps=renoise_steps)
         xz_batch = generator(px * SCALE, pz_t, py * SCALE,
                              batch_size=avg_grad_batch_size,
-                             z_clean=z_xz, t_renoise=t_renoise)
+                             z_clean=z_xz, t_renoise=t_renoise,
+                             renoise_steps=renoise_steps)
 
         losses = torch.stack([
             loss_fn(xy_batch[i], xy_target) + loss_fn(xz_batch[i], xz_target)
@@ -498,6 +569,9 @@ def _run_dual_proj_sgd(
             z_xy = _encode_latent(generator, xy_batch[best_idx].detach(), device)
             z_xz = _encode_latent(generator, xz_batch[best_idx].detach(), device)
 
+        # Record the momentum that produced current_loss, before the optimizer moves it
+        current_mom = _mom()
+
         grad_norm = torch.sqrt(
             sum(p.grad.data.norm() ** 2 for p in params if p.grad is not None)
         ).item()
@@ -510,7 +584,6 @@ def _run_dual_proj_sgd(
         opt.step()
         sched.step()
 
-        current_mom = _mom()
         if current_loss < best_loss:
             best_loss = current_loss
             best_mom  = current_mom
@@ -567,8 +640,11 @@ def run_inference(
     renoise=0.0,         # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
     renoise_truth_init=False,       # if True, seed first step's z_clean from the truth image
     renoise_truth_every_step=False, # if True, always renoise from truth (never update z_clean)
-    renoise_schedule='constant',    # 'constant', 'lr' (track the LR schedule), 'linear', 'cosine'
+    renoise_schedule='constant',    # 'constant', 'lr' (track the LR schedule), 'step' (track |Δp|), 'linear', 'cosine'
     renoise_min=0.0,                # final renoise fraction for non-constant schedules
+    renoise_step_ref=50.0,          # 'step' schedule: |Δp| (MeV) at which the fraction reaches `renoise`
+    renoise_scale_steps=False,      # if True, scale the gradient DDIM steps with t_renoise / T_max
+    renoise_min_steps=2,            # floor on the scaled DDIM steps
 ):
     """
     Run gradient-guided LDM inference to recover proton momenta from a detector image.
@@ -645,9 +721,23 @@ def run_inference(
         'constant' (default) / 'fixed' — fixed at `renoise`;
         'lr'     — proportional to the current learning rate, mapping
                    [lr_min, learning_rate] onto [renoise_min, renoise];
+        'step'   — proportional to the momentum displacement |Δp| of the previous
+                   update (largest over tracks), mapping [0, renoise_step_ref] onto
+                   [renoise_min, renoise] and saturating above; the first step uses
+                   `renoise`.  Unlike 'lr', this sees the actual step after AdamW
+                   normalisation and gradient clipping;
         'linear' / 'cosine' — independent linear / cosine decay over n_iterations.
     renoise_min : float
         Final re-noise fraction for non-constant schedules.
+    renoise_step_ref : float
+        For renoise_schedule='step': |Δp| in MeV that maps to the full `renoise`.
+    renoise_scale_steps : bool
+        If True, a renoised chain (t_renoise → 0) uses fewer gradient DDIM steps,
+        keeping the timestep spacing of the full ddim_steps_gradient chain:
+        about ddim_steps_gradient × t_renoise / T_max.  Re-evaluated every step,
+        so it follows the renoise schedule.
+    renoise_min_steps : int
+        Floor on the scaled DDIM steps (>= 2; 2 is a single DDIM update).
 
     Returns
     -------
@@ -740,6 +830,9 @@ def run_inference(
             renoise_truth_every_step=renoise_truth_every_step,
             renoise_schedule=renoise_schedule,
             renoise_min=renoise_min,
+            renoise_step_ref=renoise_step_ref,
+            renoise_scale_steps=renoise_scale_steps,
+            renoise_min_steps=renoise_min_steps,
             verbose=verbose,
         )
 
@@ -849,6 +942,9 @@ def run_inference(
         renoise_truth_every_step=renoise_truth_every_step,
         renoise_schedule=renoise_schedule,
         renoise_min=renoise_min,
+        renoise_step_ref=renoise_step_ref,
+        renoise_scale_steps=renoise_scale_steps,
+        renoise_min_steps=renoise_min_steps,
         return_renoise_path=True,
     )
 
