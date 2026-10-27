@@ -1,4 +1,6 @@
 """Image-space losses between generated and target detector images, plus a name registry."""
+import functools
+
 import torch
 from geomloss import SamplesLoss
 
@@ -287,6 +289,27 @@ _LOSS_REGISTRY = {
 
 LOSS_NAMES = list(_LOSS_REGISTRY.keys())
 
+# Losses that accept a [B, H, W] batch against one [H, W] target and return [B]
+_BATCHED_LOSSES = {sliced_wasserstein_loss}
+
+
+def batch_loss(loss_fn, generated_batch, target_img):
+    """
+    Per-sample losses [B] for a [B, H, W] batch against a single target.
+
+    Batch-aware losses (see _BATCHED_LOSSES, also when wrapped in
+    functools.partial) are evaluated in one vectorized call; any other loss
+    falls back to a per-sample loop.  A single [H, W] image is treated as B=1.
+    """
+    if generated_batch.ndim == 2:
+        generated_batch = generated_batch.unsqueeze(0)
+    base = loss_fn
+    while isinstance(base, functools.partial):
+        base = base.func
+    if base in _BATCHED_LOSSES:
+        return loss_fn(generated_batch, target_img)
+    return torch.stack([loss_fn(img, target_img) for img in generated_batch])
+
 
 def get_loss_fn(name_or_callable):
     """
@@ -309,3 +332,21 @@ def get_loss_fn(name_or_callable):
             f"Available: {', '.join(sorted(set(_LOSS_REGISTRY.keys())))}"
         )
     return _LOSS_REGISTRY[key]
+
+
+# Early-stop thresholds (min_distance) for the calibrated losses; any other loss
+# falls back to _FALLBACK_MIN_DISTANCE.  SW1 was calibrated at n_proj = 64
+# (paper_plots/compare_losses/slicedW_vs_emd/threshold/sw_threshold.py).
+_DEFAULT_MIN_DISTANCE = {
+    emd_loss_with_gradients: 0.056,
+    sliced_wasserstein_loss: 0.14,
+}
+_FALLBACK_MIN_DISTANCE = 0.05
+
+
+def default_min_distance(name_or_callable):
+    """Default early-stop threshold for a loss (name, callable or functools.partial)."""
+    base = get_loss_fn(name_or_callable)
+    while isinstance(base, functools.partial):
+        base = base.func
+    return _DEFAULT_MIN_DISTANCE.get(base, _FALLBACK_MIN_DISTANCE)

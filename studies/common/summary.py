@@ -172,6 +172,54 @@ def _plot_emd_vs_momentum(final_emds, truth_mom, out_path):
     print(f"Saved: {out_path}")
 
 
+def _fmt_mom(mom):
+    """One 'px py pz' line per track."""
+    return '\n'.join(f'px={p[0]:.0f}  py={p[1]:.0f}  pz={p[2]:.0f}' for p in np.atleast_2d(mom))
+
+
+def _plot_example_events(events_dir, n_events, out_path, n_show=6, seed=0):
+    """True image vs best generated image for n_show random events (fixed seed, so
+    --plot_only redraws the same events). Reads each event's data_files/."""
+    rng   = np.random.default_rng(seed)
+    picks = np.sort(rng.choice(n_events, size=min(n_show, n_events), replace=False))
+
+    rows = []
+    for ev_i in picks:
+        d = os.path.join(events_dir, f'event_{ev_i:03d}', 'data_files')
+        try:
+            target = np.load(os.path.join(d, 'target_img.npy'))
+            final  = np.load(os.path.join(d, 'final_img.npy'))
+            dist   = np.load(os.path.join(d, 'dist_path.npy'))
+            moms   = np.load(os.path.join(d, 'mom_path.npy'))
+            truth  = np.load(os.path.join(d, 'truth_mom.npy'))
+        except FileNotFoundError as e:
+            print(f"[example events] skipping event_{ev_i:03d}: missing {os.path.basename(e.filename)}")
+            continue
+        best = int(np.argmin(dist))
+        rows.append((ev_i, np.squeeze(target), np.squeeze(final), best, dist[best], moms[best], truth))
+    if not rows:
+        print(f"[example events] no usable events in {events_dir}, skipping {os.path.basename(out_path)}")
+        return
+
+    fig, axes = plt.subplots(len(rows), 2, figsize=(7, 3.6 * len(rows)), squeeze=False)
+    for (ev_i, target, final, best, emd, mom, truth), (ax_t, ax_f) in zip(rows, axes):
+        vmax = max(target.max(), final.max())
+        vmax = vmax if vmax > 0 else 1.0
+        panels = [(ax_t, target, f'Event {ev_i}: true\n{_fmt_mom(truth)}'),
+                  (ax_f, final,  f'Best (step {best}), EMD = {emd:.4f}\n{_fmt_mom(mom)}')]
+        for ax, img, title in panels:
+            ax.imshow(img, cmap='gray', vmin=0, vmax=vmax, interpolation='nearest')
+            ax.set_title(title, fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    fig.tight_layout()
+    fig.suptitle('True vs best generated image (random events)', fontsize=13, y=1.0, va='bottom')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
 def _make_summary_plots(final_emds, truth_mom_arr, final_mom_arr,
                         min_distance, n_tracks, summary_dir, angles=None):
     """Generate all summary plots from arrays. Called both after inference and in --plot_only mode."""
@@ -386,6 +434,11 @@ def _print_stats(label, emds, min_distance):
     print(f"Converged (< {min_distance}): {conv:.1f}%")
 
 
+def _events_dir(summary_dir):
+    """<run>/summary -> <run>/events"""
+    return os.path.join(os.path.dirname(os.path.abspath(summary_dir)), 'events')
+
+
 def _plot_standard(r, min_distance, summary_dir):
     _save_emd_ranking(r.final_emds, summary_dir, angles=r.angles)
     if r.n_steps is not None:
@@ -395,6 +448,8 @@ def _plot_standard(r, min_distance, summary_dir):
         r.final_emds, r.truth_mom, r.final_mom,
         min_distance, _n_tracks(r.final_mom, r.angles), summary_dir, angles=r.angles,
     )
+    _plot_example_events(_events_dir(summary_dir), len(r.final_emds),
+                         os.path.join(summary_dir, 'plot_example_events.png'))
 
 
 def _plot_pz_both(ref, pz0, min_distance, summary_dir):
@@ -404,6 +459,8 @@ def _plot_pz_both(ref, pz0, min_distance, summary_dir):
         if r.n_steps is not None:
             _plot_n_steps(r.n_steps, r.final_emds, min_distance,
                           os.path.join(summary_dir, f'plot_n_steps_{label}.png'))
+        _plot_example_events(os.path.join(_events_dir(summary_dir), label), len(r.final_emds),
+                             os.path.join(summary_dir, f'plot_example_events_{label}.png'))
     _make_pz_both_summary_plots(
         ref.final_emds, ref.final_mom, ref.truth_mom,
         pz0.final_emds, pz0.final_mom, pz0.truth_mom,

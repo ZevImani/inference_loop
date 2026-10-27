@@ -692,11 +692,6 @@ def save_event_plots(img_path, dist_path, mom_path, lr_path,
         save_path=os.path.join(plot_dir, 'sgd_images.png'),
         n_cols=5,
     )
-    create_sgd_gif(
-        img_path, dist_path, mom_path, lr_path,
-        save_path=os.path.join(plot_dir, 'sgd_evolution.gif'),
-        fps=4, stride=1,
-    )
     plot_sgd_results(dist_path, mom_path, truth_mom_plot, save_dir=plot_dir)
     plot_initial_final(
         img_path, dist_path, mom_path,

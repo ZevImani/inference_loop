@@ -3,7 +3,7 @@
 # (prefix with `inference.` when running studies/run_study.py).
 
 n_iterations: 40          # frames in the output, including step 0
-min_distance: 0.05        # early-stop once the best loss drops below this
+min_distance: null        # early-stop once the best loss drops below this; null = per-loss default (emd 0.056, sw 0.14, others 0.05)
 
 optimizer:
   name: adamw               # SGD | adam | adamw  (adam and adamw both use AdamW)
@@ -13,6 +13,8 @@ optimizer:
   reparam_pmag: false     # optimise (px, py, |p|) and derive pz
   newton_pz: false        # scale the pz (or |p|) grad by the inverse diagonal Hessian; costs one extra backward
   fix_pz: false           # hold pz at its starting value; only px, py are optimised (pair with init.truth_pz)
+  ke_min: 40.0            # proton KE bounds (MeV): |p| is projected onto sqrt(KE² + 2·KE·m_p) after every step,
+  ke_max: 110.0           #   40 → 276.9, 110 → 467.5 MeV/c (training range 50–100 MeV); null disables that side
 
 sampling:
   avg_grad: true          # average the loss over a batch of stochastic LDM samples
@@ -22,8 +24,8 @@ sampling:
   ddim_steps_gradient: 10 # DDIM steps for gradient-enabled generation
 
 loss:
-  name: emd               # emd/w1/sinkhorn, unbal_emd/uemd, w2, energy, gaussian_mmd, laplacian_mmd, l2/mse
-  kwargs: {}              # passed to the loss, e.g. {reg: 0.05, reg_m: 0.5} for uemd
+  name: sw                # sw/sliced_w (sliced Wasserstein-1, L = n_proj = 64), emd/w1/sinkhorn, unbal_emd/uemd, w2, energy, gaussian_mmd, laplacian_mmd, l2/mse
+  kwargs: {}              # passed to the loss, e.g. {n_proj: 128} for sw, {reg: 0.05, reg_m: 0.5} for uemd
 
 init:
   method: hull            # hull (falls back to random if the hull fails) | random
@@ -38,11 +40,11 @@ init:
   angle_jitter_deg: 0.0   # std (deg) of a random 3D rotation of each starting direction; gives pz=0 guesses a pz
 
 renoise:
-  frac: 0.0               # re-noise fraction in [0, 1]: start each DDIM run from the previous image noised to frac*T_max; 0 disables
-  schedule: constant      # constant | fixed | lr (track the LR schedule) | step (track the last |Δp|) | linear | cosine
+  frac: 1.0               # re-noise fraction in [0, 1]: start each DDIM run from the previous image noised to frac*T_max; 0 disables
+  schedule: step          # constant | fixed | lr (track the LR schedule) | step (track the last |Δp|) | linear | cosine
   min: 0.1                # final fraction for non-constant schedules
   step_ref: 50.0          # schedule=step: previous-step |Δp| (MeV) that maps to the full frac; bigger steps saturate
   truth_init: false       # seed the first step's latent from the truth image
   truth_every_step: false # always renoise from the truth latent
-  scale_steps: false      # use ~ddim_steps_gradient*frac DDIM steps for the shorter renoised chain (same step spacing)
+  scale_steps: true       # use ~ddim_steps_gradient*frac DDIM steps for the shorter renoised chain (same step spacing)
   min_steps: 2            # floor on the scaled DDIM steps (2 = one DDIM update)

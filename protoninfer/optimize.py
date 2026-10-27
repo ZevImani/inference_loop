@@ -13,9 +13,79 @@ from omegaconf import OmegaConf
 
 from .config import InferenceConfig
 from .initial_guess import convex_hull_initial_guess, perturb_momentum, random_momentum_init
-from .losses import get_loss_fn
+from .losses import batch_loss, default_min_distance, get_loss_fn
 from .model import DifferentiableLDMGenerator, load_ldm
 from .plotting import save_event_plots
+
+
+# ── Kinetic-energy bounds on the queried momentum ─────────────────────────────
+#
+# The LDM was trained on protons with KE in [50, 100] MeV (|p| ≈ 310–445 MeV/c).
+# Outside that range the generator extrapolates and can still return a plausible
+# track, so the loss keeps falling while |p| runs off (e.g. to ~1100 MeV/c).
+# Every optimizer step is therefore projected back onto KE_MIN <= KE <= KE_MAX,
+# a 10 MeV margin around the training range.
+
+PROTON_MASS = 938.272   # MeV/c²
+KE_MIN      = 40.0      # MeV
+KE_MAX      = 110.0     # MeV
+
+
+def ke_to_pmag(ke):
+    """
+    |p| (MeV/c) of a proton with kinetic energy `ke` (MeV).
+
+    E = KE + m and E² = p² + m², so p = sqrt((KE + m)² − m²) = sqrt(KE² + 2·KE·m):
+        KE =  40 MeV → |p| ≈ 276.9 MeV/c
+        KE = 110 MeV → |p| ≈ 467.5 MeV/c
+    """
+    return float(np.sqrt(ke**2 + 2.0 * ke * PROTON_MASS))
+
+
+def _pmag_bounds(ke_bounds, scale):
+    """(lo, hi) |p| bounds in normalised units (momentum / scale); None side = unbounded."""
+    if ke_bounds is None:
+        return None
+    ke_lo, ke_hi = ke_bounds
+    lo = ke_to_pmag(ke_lo) / scale if ke_lo is not None else 0.0
+    hi = ke_to_pmag(ke_hi) / scale if ke_hi is not None else float('inf')
+    return lo, hi
+
+
+def _clamp_pmag_(px, py, p3, bounds, reparam_pmag=False, fix_pz=False):
+    """
+    In place: pull one track's momentum back onto lo <= |p| <= hi (normalised units),
+    keeping its direction.  A no-op when |p| is already inside the bounds.
+
+    p3 is pz in direct mode, or the |p| parameter when reparam_pmag.
+    """
+    if bounds is None:
+        return
+    lo, hi = bounds
+    with torch.no_grad():
+        pt = float(torch.sqrt(px**2 + py**2))
+        if reparam_pmag:
+            # pz = sqrt(|p|² − pT²) floors at 0, so the effective |p| is max(p3, pT):
+            # bound the |p| parameter, and pT from above.
+            p3.clamp_(lo, hi)
+            if pt > hi:
+                px.mul_(hi / pt)
+                py.mul_(hi / pt)
+            return
+        pmag = float(torch.sqrt(px**2 + py**2 + p3**2))
+        if lo <= pmag <= hi or pmag == 0.0:
+            return
+        target = min(max(pmag, lo), hi)
+        if fix_pz:
+            # pz is frozen: reach the target |p| by rescaling pT alone
+            if pt == 0.0:
+                return
+            pt_target = np.sqrt(max(target**2 - float(p3)**2, 0.0))
+            px.mul_(pt_target / pt)
+            py.mul_(pt_target / pt)
+        else:
+            for p in (px, py, p3):
+                p.mul_(target / pmag)
 
 
 # ── Core SGD (generalized to N tracks) ────────────────────────────────────────
@@ -65,6 +135,11 @@ def _momentum_step(prev_mom, cur_mom):
     return float(np.linalg.norm(delta, axis=1).max())
 
 
+def _as_batch(imgs):
+    """[B, H, W] view of generator output; batch_size=1 comes back squeezed to [H, W]."""
+    return imgs.reshape(-1, *imgs.shape[-2:])
+
+
 def _encode_latent(generator, img, device):
     """Clean LDM latent [1, C, h, w] of a (H, W) image, used as z_clean for renoising."""
     with torch.no_grad():
@@ -80,7 +155,7 @@ def _run_sgd_core(
     learning_rate=0.1,
     lr_min=0.001,
     gradient_clip=1.0,
-    min_distance=0.05,
+    min_distance=None,     # None = per-loss default (see losses.default_min_distance)
     optimizer_type='SGD',
     avg_grad=True,
     avg_grad_batch_size=32,
@@ -92,6 +167,7 @@ def _run_sgd_core(
     reparam_pmag=False,     # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
     newton_pz=False,        # if True, scale pz (or pmag) grad by diagonal Hessian inverse before stepping
     fix_pz=False,           # if True, hold pz at its initial value and optimise only (px, py)
+    ke_bounds=(KE_MIN, KE_MAX),      # (min, max) proton KE in MeV; |p| is projected into range after each step; None disables
     renoise=0.0,            # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
     renoise_truth_init=False,        # if True, seed z_clean from the truth image on the first step
     renoise_truth_every_step=False,  # if True, always renoise from truth (never update z_clean)
@@ -190,6 +266,11 @@ def _run_sgd_core(
         ]
         params_list.append(group)
 
+    # Start inside the KE bounds too, so step 0 doesn't query the LDM out of domain
+    pmag_bounds = _pmag_bounds(ke_bounds, SCALE)
+    for group in params_list:
+        _clamp_pmag_(*group, pmag_bounds, reparam_pmag, fix_pz)
+
     if reparam_pmag:
         def _pz_derived(group, sign_pz):
             px_n, py_n, pmag_n = group
@@ -273,19 +354,14 @@ def _run_sgd_core(
         if avg_grad:
             # Generate one batch per track, then sum across tracks element-wise
             batches = [
-                generator(g[0] * SCALE, g[1] * SCALE,
-                          _pz_derived(g, sign_pz_list[t]) * SCALE,
-                          batch_size=avg_grad_batch_size,
-                          z_clean=z_clean, t_renoise=t_renoise,
-                          renoise_steps=renoise_steps)
+                _as_batch(generator(g[0] * SCALE, g[1] * SCALE,
+                                    _pz_derived(g, sign_pz_list[t]) * SCALE,
+                                    batch_size=avg_grad_batch_size,
+                                    z_clean=z_clean, t_renoise=t_renoise,
+                                    renoise_steps=renoise_steps))
                 for t, g in enumerate(params_list)
             ]
-            losses = torch.stack([
-                loss_fn(
-                    sum(batches[t][i] for t in range(n_tracks)), target_img
-                )
-                for i in range(avg_grad_batch_size)
-            ])
+            losses = batch_loss(loss_fn, sum(batches), target_img)
             if newton_pz:
                 all_params_flat = [p for group in params_list for p in group]
                 grads_all = torch.autograd.grad(
@@ -360,6 +436,8 @@ def _run_sgd_core(
         for opt, sched in zip(optimizers, schedulers):
             opt.step()
             sched.step()
+        for group in params_list:
+            _clamp_pmag_(*group, pmag_bounds, reparam_pmag, fix_pz)
 
         if current_loss < best_loss:
             best_loss    = current_loss
@@ -416,7 +494,7 @@ def _run_dual_proj_sgd(
     learning_rate=0.1,
     lr_min=0.001,
     gradient_clip=1.0,
-    min_distance=0.05,
+    min_distance=None,     # None = per-loss default (see losses.default_min_distance)
     optimizer_type='SGD',
     avg_grad_batch_size=32,
     device='cuda',
@@ -424,6 +502,7 @@ def _run_dual_proj_sgd(
     loss_fn=None,           # callable override; if set, takes precedence over loss_type
     reparam_pmag=False,     # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
     fix_pz=False,           # if True, hold pz at its initial value and optimise only (px, py)
+    ke_bounds=(KE_MIN, KE_MAX),  # (min, max) proton KE in MeV; see _run_sgd_core
     renoise=0.0,            # fraction [0,1]; see _run_sgd_core
     renoise_truth_init=False,
     renoise_truth_every_step=False,
@@ -479,6 +558,9 @@ def _run_dual_proj_sgd(
             return pz_param.item()
     params = [px, py, pz_param]
     trainable = [p for p in params if p.requires_grad]   # drops pz when fix_pz
+
+    pmag_bounds = _pmag_bounds(ke_bounds, SCALE)
+    _clamp_pmag_(*params, pmag_bounds, reparam_pmag, fix_pz)
 
     if optimizer_type.lower() in ('adam', 'adamw'):
         opt = torch.optim.AdamW(trainable, lr=learning_rate)
@@ -546,19 +628,16 @@ def _run_dual_proj_sgd(
         opt.zero_grad()
 
         pz_t     = _pz_n() * SCALE
-        xy_batch = generator(px * SCALE, py * SCALE, pz_t,
-                             batch_size=avg_grad_batch_size,
-                             z_clean=z_xy, t_renoise=t_renoise,
-                             renoise_steps=renoise_steps)
-        xz_batch = generator(px * SCALE, pz_t, py * SCALE,
-                             batch_size=avg_grad_batch_size,
-                             z_clean=z_xz, t_renoise=t_renoise,
-                             renoise_steps=renoise_steps)
+        xy_batch = _as_batch(generator(px * SCALE, py * SCALE, pz_t,
+                                       batch_size=avg_grad_batch_size,
+                                       z_clean=z_xy, t_renoise=t_renoise,
+                                       renoise_steps=renoise_steps))
+        xz_batch = _as_batch(generator(px * SCALE, pz_t, py * SCALE,
+                                       batch_size=avg_grad_batch_size,
+                                       z_clean=z_xz, t_renoise=t_renoise,
+                                       renoise_steps=renoise_steps))
 
-        losses = torch.stack([
-            loss_fn(xy_batch[i], xy_target) + loss_fn(xz_batch[i], xz_target)
-            for i in range(avg_grad_batch_size)
-        ])
+        losses = batch_loss(loss_fn, xy_batch, xy_target) + batch_loss(loss_fn, xz_batch, xz_target)
         losses.mean().backward()
 
         best_idx     = losses.detach().argmin().item()
@@ -583,6 +662,7 @@ def _run_dual_proj_sgd(
 
         opt.step()
         sched.step()
+        _clamp_pmag_(*params, pmag_bounds, reparam_pmag, fix_pz)
 
         if current_loss < best_loss:
             best_loss = current_loss
@@ -615,7 +695,7 @@ def run_inference(
     learning_rate=0.1,
     lr_min=0.001,
     gradient_clip=1.0,
-    min_distance=0.05,
+    min_distance=None,     # None = per-loss default (see losses.default_min_distance)
     optimizer_type='SGD',
     avg_grad=True,
     avg_grad_batch_size=32,
@@ -631,19 +711,20 @@ def run_inference(
     verbose=True,
     save_plots=True,
     generator=None,  # pass a pre-loaded DifferentiableLDMGenerator to skip model loading
-    loss_type='emd', # string name resolved via get_loss_fn; ignored when loss_fn is set
+    loss_type='sw',  # string name resolved via get_loss_fn; ignored when loss_fn is set
     loss_fn=None,    # callable (generated_img, target_img) -> scalar; overrides loss_type
     reparam_pmag=False,  # if True, optimise (px, py, |p|) and derive pz; default: direct (px, py, pz)
     newton_pz=False,     # if True, scale pz (or pmag) grad by diagonal Hessian inverse before stepping
     fix_pz=False,        # if True, hold pz at its initial value and optimise only (px, py)
     init_pz=None,       # if set (float, MeV), override the pz component of every track's initial guess
-    renoise=0.0,         # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
+    ke_bounds=(KE_MIN, KE_MAX),  # (min, max) proton KE in MeV that |p| is clamped to; None disables
+    renoise=1.0,        # fraction [0,1]; noise previous image to T=renoise*T_max and start DDIM there
     renoise_truth_init=False,       # if True, seed first step's z_clean from the truth image
     renoise_truth_every_step=False, # if True, always renoise from truth (never update z_clean)
-    renoise_schedule='constant',    # 'constant', 'lr' (track the LR schedule), 'step' (track |Δp|), 'linear', 'cosine'
-    renoise_min=0.0,                # final renoise fraction for non-constant schedules
+    renoise_schedule='step',        # 'constant', 'lr' (track the LR schedule), 'step' (track |Δp|), 'linear', 'cosine'
+    renoise_min=0.1,                # final renoise fraction for non-constant schedules
     renoise_step_ref=50.0,          # 'step' schedule: |Δp| (MeV) at which the fraction reaches `renoise`
-    renoise_scale_steps=False,      # if True, scale the gradient DDIM steps with t_renoise / T_max
+    renoise_scale_steps=True,       # if True, scale the gradient DDIM steps with t_renoise / T_max
     renoise_min_steps=2,            # floor on the scaled DDIM steps
 ):
     """
@@ -674,8 +755,9 @@ def run_inference(
         Minimum learning rate for the cosine schedule.
     gradient_clip : float
         Per-track gradient norm clip (normalised space).
-    min_distance : float
-        Early-stopping EMD threshold.
+    min_distance : float or None
+        Early-stopping loss threshold.  None uses the loss's default:
+        0.056 for 'emd', 0.14 for 'sw' (n_proj = 64), 0.05 for any other loss.
     optimizer_type : str
         'SGD' or 'adamw'.
     avg_grad : bool
@@ -700,7 +782,8 @@ def run_inference(
         Generate and save diagnostic plots.
     loss_type : str
         Name of the loss function (resolved via get_loss_fn).  Supported values:
-        'emd'/'w1'/'sinkhorn' (default), 'unbal_emd'/'uemd' (unbalanced W1),
+        'sw'/'sliced_w'/'swd' (sliced Wasserstein-1, n_proj = 64; default),
+        'emd'/'w1'/'sinkhorn', 'unbal_emd'/'uemd' (unbalanced W1),
         'w2'/'sinkhorn_p2', 'energy',
         'gaussian_mmd'/'gmmd', 'laplacian_mmd'/'lmmd', 'l2'/'mse'.
         Ignored when loss_fn is provided.
@@ -713,19 +796,27 @@ def run_inference(
         gradients by the local curvature, helping the optimizer move in the pz
         direction even when d(loss)/d(pz) is small.  Costs one extra backward pass
         per iteration.  Consider reducing avg_grad_batch_size if memory is tight.
+    ke_bounds : (float or None, float or None) or None
+        Proton kinetic-energy range (MeV) the momentum is kept in.  The initial
+        guess and every optimizer step are projected radially onto the matching
+        |p| shell (see ke_to_pmag); a no-op while |p| is inside it.  Default
+        (40, 110) MeV, i.e. |p| ≈ 276.9–467.5 MeV/c, a 10 MeV margin around the
+        LDM's 50–100 MeV training range.  None (or a None side) disables.
     renoise : float
         Initial re-noise fraction [0, 1]; t_renoise = renoise × T_max.  0 disables.
+        Default 1.0 with the 'step' schedule down to renoise_min = 0.1 and scaled
+        DDIM steps (renoise_scale_steps=True).
     renoise_schedule : str
         How the re-noise fraction evolves over iterations, decaying from
         `renoise` to `renoise_min`:
-        'constant' (default) / 'fixed' — fixed at `renoise`;
+        'constant' / 'fixed' — fixed at `renoise`;
         'lr'     — proportional to the current learning rate, mapping
                    [lr_min, learning_rate] onto [renoise_min, renoise];
         'step'   — proportional to the momentum displacement |Δp| of the previous
                    update (largest over tracks), mapping [0, renoise_step_ref] onto
                    [renoise_min, renoise] and saturating above; the first step uses
                    `renoise`.  Unlike 'lr', this sees the actual step after AdamW
-                   normalisation and gradient clipping;
+                   normalisation and gradient clipping (default);
         'linear' / 'cosine' — independent linear / cosine decay over n_iterations.
     renoise_min : float
         Final re-noise fraction for non-constant schedules.
@@ -743,7 +834,7 @@ def run_inference(
     -------
     results : dict with keys:
         img_path     - list of image tensors (one per step)
-        dist_path    - list of EMD losses
+        dist_path    - list of losses (configured loss)
         mom_path     - list of momentum tuples
         explore_path - list of bool
         lr_path      - list of learning rates
@@ -752,6 +843,9 @@ def run_inference(
         elapsed      - wall-clock seconds
     """
     start_time = time.time()
+
+    if min_distance is None:
+        min_distance = default_min_distance(loss_fn if loss_fn is not None else loss_type)
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -825,6 +919,7 @@ def run_inference(
             loss_fn=loss_fn,
             reparam_pmag=reparam_pmag,
             fix_pz=fix_pz,
+            ke_bounds=ke_bounds,
             renoise=renoise,
             renoise_truth_init=renoise_truth_init,
             renoise_truth_every_step=renoise_truth_every_step,
@@ -937,6 +1032,7 @@ def run_inference(
         reparam_pmag=reparam_pmag,
         newton_pz=newton_pz,
         fix_pz=fix_pz,
+        ke_bounds=ke_bounds,
         renoise=renoise,
         renoise_truth_init=renoise_truth_init,
         renoise_truth_every_step=renoise_truth_every_step,

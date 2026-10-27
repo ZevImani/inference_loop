@@ -29,7 +29,7 @@ class RunConfig:
     seed: Optional[int] = None            # seeds torch + numpy for a reproducible run
     run_name: Optional[str] = None        # default: <study prefix>_<timestamp>
     output_dir: str = '${paths.output_dir}'
-    save_plots: bool = True               # per-event diagnostic plots
+    save_plots: bool = False              # per-event diagnostic plots (off: they dominate disk use)
     keep_img_path: bool = False           # keep the large per-event img_path.pt
     data: Dict[str, Any] = field(default_factory=dict)  # study-specific (path, which, angle_min, ...)
     inference: InferenceConfig = field(default_factory=InferenceConfig)

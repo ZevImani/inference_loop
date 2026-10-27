@@ -17,7 +17,7 @@ Output layout
 -------------
 <output_dir>/<run_name>/
     config.yaml                  (fully resolved config for this run)
-    events/event_NNN/            (data_files/, plots/; events/ref/, events/pz0/ for pzboth)
+    events/event_NNN/            (data_files/, plots/ if save_plots=true; events/ref/, events/pz0/ for pzboth)
     summary/                     (summary.npz, emd_ranking.txt, plot_*.png)
 """
 import argparse

@@ -5,7 +5,7 @@ Recover the 3D momentum of proton tracks from 2D detector images by running grad
 Given a target image, the loop starts from an initial guess of `(px, py, pz)` for each track. At each step it:
 
 1. Generates images for the current guess with the LDM.
-2. Measures how far they are from the target with an image-space loss (Sinkhorn EMD by default).
+2. Measures how far they are from the target with an image-space loss (sliced Wasserstein-1 by default).
 3. Backpropagates through the diffusion sampler and updates the momenta.
 
 For multi-track events, the image generated for each track is summed before the loss, so a single loss drives all the tracks.
@@ -145,17 +145,28 @@ Hyperparameters are defined as typed dataclasses in [`protoninfer/config.py`](pr
 
 | Group | Settings |
 | --- | --- |
-| top level | `n_iterations`, `min_distance` (early-stop threshold) |
-| `optimizer` | `name` (SGD / adam / adamw), `lr`, `lr_min`, `gradient_clip`, `reparam_pmag`, `newton_pz` |
+| top level | `n_iterations`, `min_distance` (early-stop threshold; `null` picks the loss's default) |
+| `optimizer` | `name` (SGD / adam / adamw), `lr`, `lr_min`, `gradient_clip`, `reparam_pmag`, `newton_pz`, `fix_pz`, `ke_min`, `ke_max` |
 | `sampling` | `avg_grad`, `batch_size`, `fixed_z`, `ddim_steps_standard`, `ddim_steps_gradient` |
-| `loss` | `name` (emd, unbal_emd, w2, energy, gaussian_mmd, laplacian_mmd, l2), `kwargs` |
+| `loss` | `name` (sw, emd, unbal_emd, w2, energy, gaussian_mmd, laplacian_mmd, l2), `kwargs` |
 | `init` | `method` (hull / random), `use_pmag`, `init_pz` |
 | `renoise` | `frac`, `schedule`, `min`, `step_ref`, `truth_init`, `truth_every_step`, `scale_steps`, `min_steps` |
+
+### Defaults: loss, early stopping, renoising and energy bounds
+
+- **Loss:** sliced Wasserstein-1 (`loss.name: sw`) with L = 64 projection directions. That is the default `n_proj` of `sliced_wasserstein_loss`; to change it, set `loss.kwargs.n_proj`.
+- **Early stopping:** `min_distance: null` uses a threshold calibrated for the chosen loss: 0.14 for `sw` and 0.056 for `emd` (Sinkhorn EMD). Other losses fall back to 0.05. The `sw` threshold was calibrated with L = 64. Setting `min_distance` to a number always overrides the per-loss value.
+- **Renoising:** dynamic, on by default. Each DDIM run starts from the previous image noised to `frac × T_max`. With `schedule: step`, the fraction follows the size of the last momentum update: it is `frac = 1.0` for a step of `step_ref` (50 MeV) or more, and falls linearly to `min = 0.1` as the step shrinks. With `scale_steps: true`, the gradient DDIM chain gets shorter as the fraction drops, using about `ddim_steps_gradient × fraction` steps (at least `min_steps`), so the timestep spacing stays the same.
+- **Energy bounds:** the LDM was trained on protons with kinetic energy 50–100 MeV (|p| ≈ 310–445 MeV/c). Outside that range it extrapolates and can still produce a plausible track, so the loss keeps falling while |p| drifts far out of range. The initial guess and every optimizer step are therefore projected radially back into `optimizer.ke_min`–`ke_max` (default 40–110 MeV, i.e. |p| = √(KE² + 2·KE·m_p) ≈ 277–467 MeV/c). The projection does nothing while |p| is inside the bounds. A fit that ends exactly on a bound means the image did not pin down the energy. Set a bound to `null` to remove it.
 
 Override any setting on the command line with dotted `key=value` pairs:
 
 ```bash
 optimizer.lr=0.05  loss.name=unbal_emd  loss.kwargs.reg_m=1.0  renoise.frac=0.3
+loss.name=emd                                      # Sinkhorn EMD; min_distance becomes 0.056
+loss.kwargs.n_proj=128  min_distance=0.12          # more SW projections, custom threshold
+renoise.frac=0                                     # turn renoising off
+renoise.schedule=constant  renoise.frac=0.4  renoise.scale_steps=false   # fixed renoise level
 ```
 
 Studies nest these settings under `inference.`, for example `inference.optimizer.lr=0.05`.
@@ -200,9 +211,19 @@ These are defined in [`studies/common/config.py`](studies/common/config.py):
 | `run_name` | Output folder name. Defaults to `<study>_<timestamp>` |
 | `output_dir` | Output root. Defaults to `studies/results` |
 | `seed` | Seeds torch and numpy for a reproducible run. Unseeded by default |
-| `save_plots` | Whether to write per-event plots |
+| `save_plots` | Whether to write per-event plots. Off by default (see below) |
 | `keep_img_path` | Keep each event's `img_path.pt`, which is large (deleted by default) |
 | `data.*` | Study-specific settings, such as the dataset path |
+
+> **Note:** `save_plots` is `false` by default. Per-event plots take up most of a run's disk space, and the summary plots don't need them. Each event still writes its small `.npy` data files, so `--plot_only` works either way. To look closely at a few events, turn the plots on with `save_plots=true`. The per-event animated GIF (`sgd_evolution.gif`) is no longer written. To draw one for an event, run with `keep_img_path=true` and then `python -m protoninfer.plotting event_NNN --results-root <run_dir>/events`.
+>
+> To free space from older runs that saved per-event plots, delete their `events/*/plots/` folders. The data files and summaries are kept:
+>
+> ```bash
+> python studies/clean_event_plots.py --dry_run                 # sizes per run, nothing deleted
+> python studies/clean_event_plots.py                           # everything under output_dir (asks first)
+> python studies/clean_event_plots.py studies/results/<run_name>
+> ```
 
 ### Output layout
 
@@ -211,12 +232,15 @@ These are defined in [`studies/common/config.py`](studies/common/config.py):
     config.yaml              # fully resolved config used for this run
     events/event_NNN/
         data_files/          # dist_path.npy, mom_path.npy, target_img.npy, truth_mom.npy, final_img.npy, ...
-        plots/               # sgd_images.png, sgd_evolution.gif, initial_final.png, ...
+        plots/               # only with save_plots=true: sgd_images.png, initial_final.png, ...
     summary/
         summary.npz          # final_emds, final_momentum, truth_momentum, [angles]
         emd_ranking.txt
         plot_*.png           # loss distribution, recovered vs truth, residuals, EMD vs momentum/angle
+        plot_example_events.png   # true vs best generated image for 6 random events
 ```
+
+The summary files and plots say "EMD", but they hold the final value of whichever loss the run used. That is SW1 by default, unless you set `inference.loss.name=emd`.
 
 For `pzboth`, the events are split into `events/ref/` and `events/pz0/`, and the summary keys carry `_ref` / `_pz0` suffixes.
 
@@ -255,7 +279,7 @@ They load real data, so `configs/paths.yaml` has to point to your datasets.
 | --- | --- |
 | `protoninfer/optimize.py` | `infer()`, `run_inference()`, and the SGD core |
 | `protoninfer/model.py` | `load_ldm()` and `DifferentiableLDMGenerator` (differentiable DDIM sampling) |
-| `protoninfer/losses.py` | EMD and the other image losses, plus `get_loss_fn()` |
+| `protoninfer/losses.py` | SW1, EMD and the other image losses, plus `get_loss_fn()` and the per-loss `default_min_distance()` |
 | `protoninfer/initial_guess.py` | Convex-hull direction guess, energy-based \|p\| estimate, random init |
 | `protoninfer/plotting.py` | Per-event diagnostic plots |
 | `protoninfer/config.py` | Config schema and YAML loading |

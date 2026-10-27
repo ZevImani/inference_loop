@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 from omegaconf import OmegaConf
 
-from .losses import get_loss_fn
+from .losses import default_min_distance, get_loss_fn
 
 OPTIMIZERS        = ('SGD', 'adam', 'adamw')
 INIT_METHODS      = ('hull', 'random')
@@ -36,9 +36,14 @@ class OptimizerConfig:
     reparam_pmag: bool = False     # optimise (px, py, |p|) and derive pz
     newton_pz: bool = False        # scale the pz (or |p|) grad by the inverse diagonal Hessian
     fix_pz: bool = False           # hold pz at its starting value; only px, py are optimised
+    ke_min: Optional[float] = 40.0   # proton KE bounds (MeV) |p| is clamped to (40 → 276.9, 110 → 467.5 MeV/c);
+    ke_max: Optional[float] = 110.0  # training range is 50–100 MeV; null disables that side
 
     def __post_init__(self):
         _check_choice('optimizer.name', self.name, OPTIMIZERS)
+        if self.ke_min is not None and self.ke_max is not None and not 0.0 <= self.ke_min < self.ke_max:
+            raise ValueError(f"optimizer.ke_min={self.ke_min}, optimizer.ke_max={self.ke_max}; "
+                             "expected 0 <= ke_min < ke_max")
         if self.fix_pz and (self.reparam_pmag or self.newton_pz):
             raise ValueError("optimizer.fix_pz cannot be combined with reparam_pmag or newton_pz")
 
@@ -54,8 +59,8 @@ class SamplingConfig:
 
 @dataclass
 class LossConfig:
-    name: str = 'emd'              # see protoninfer.losses.LOSS_NAMES
-    kwargs: Dict[str, Any] = field(default_factory=dict)  # e.g. {reg: 0.05, reg_m: 0.5} for uemd
+    name: str = 'sw'               # see protoninfer.losses.LOSS_NAMES; sw = sliced Wasserstein-1 (n_proj L = 64)
+    kwargs: Dict[str, Any] = field(default_factory=dict)  # e.g. {n_proj: 128} for sw, {reg: 0.05, reg_m: 0.5} for uemd
 
     def __post_init__(self):
         get_loss_fn(self.name)     # raises on unknown names
@@ -85,13 +90,13 @@ class InitConfig:
 
 @dataclass
 class RenoiseConfig:
-    frac: float = 0.0              # re-noise fraction in [0, 1]; 0 disables
-    schedule: str = 'constant'     # constant | fixed | lr | step | linear | cosine
+    frac: float = 1.0              # re-noise fraction in [0, 1]; 0 disables
+    schedule: str = 'step'         # constant | fixed | lr | step | linear | cosine
     min: float = 0.1               # final fraction for non-constant schedules
     step_ref: float = 50.0         # schedule=step: previous-step |Δp| (MeV) that maps to the full frac
     truth_init: bool = False       # seed the first step's latent from the truth image
     truth_every_step: bool = False # always renoise from the truth latent
-    scale_steps: bool = False      # scale the gradient DDIM steps with the renoise level (keeps step spacing)
+    scale_steps: bool = True       # scale the gradient DDIM steps with the renoise level (keeps step spacing)
     min_steps: int = 2             # floor on the scaled DDIM steps (2 = one DDIM update)
 
     def __post_init__(self):
@@ -105,12 +110,16 @@ class RenoiseConfig:
 @dataclass
 class InferenceConfig:
     n_iterations: int = 40         # frames in the output, including step 0
-    min_distance: float = 0.05     # early-stop once the best loss drops below this
+    min_distance: Optional[float] = None  # early-stop threshold; None = per-loss default (emd 0.056, sw 0.14)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     init: InitConfig = field(default_factory=InitConfig)
     renoise: RenoiseConfig = field(default_factory=RenoiseConfig)
+
+    def __post_init__(self):
+        if self.min_distance is None:
+            self.min_distance = default_min_distance(self.loss.name)
 
     def loss_fn(self):
         """The configured loss callable, with loss.kwargs bound if any are set."""
@@ -129,6 +138,7 @@ class InferenceConfig:
             reparam_pmag             = self.optimizer.reparam_pmag,
             newton_pz                = self.optimizer.newton_pz,
             fix_pz                   = self.optimizer.fix_pz,
+            ke_bounds                = (self.optimizer.ke_min, self.optimizer.ke_max),
             avg_grad                 = self.sampling.avg_grad,
             avg_grad_batch_size      = self.sampling.batch_size,
             fixed_z                  = self.sampling.fixed_z,
